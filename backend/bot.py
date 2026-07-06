@@ -40,6 +40,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
+from typing import Optional, List
 
 load_dotenv()
 
@@ -1606,14 +1608,16 @@ async def process_fraud_log(callback: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — APPROVE WITHDRAWAL
 # ─────────────────────────────────────────────────────────────────────────────
-@core_router.callback_query(F.data.startswith("adm_payout_ap_"))
-async def process_admin_approval(callback: CallbackQuery):
-    if not evaluate_admin_access(callback.from_user.id):
-        return
-    tid    = int(callback.data.split("_")[3])
+async def approve_withdrawal_core(tid: int) -> dict:
+    """
+    Shared approval logic used by BOTH the bot-chat inline button and the
+    Mini App REST endpoint (/api/admin/withdrawals/approve), so there's
+    exactly one place that posts the Telebirr proof photo and notifies
+    the user.
+    """
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending":
-        return await callback.answer("Already processed.")
+        return {"ok": False, "reason": "already_processed"}
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1655,6 +1659,16 @@ async def process_admin_approval(callback: CallbackQuery):
         )
     except Exception:
         pass
+    return {"ok": True}
+
+@core_router.callback_query(F.data.startswith("adm_payout_ap_"))
+async def process_admin_approval(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id):
+        return
+    tid    = int(callback.data.split("_")[3])
+    result = await approve_withdrawal_core(tid)
+    if not result["ok"]:
+        return await callback.answer("Already processed.")
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1708,6 +1722,9 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
     await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
+    # Refund the reserved balance back to the user — it was deducted
+    # atomically at request time in create_withdrawal_atomic().
+    await DataEngine.add_balance(ticket["user_id"], float(ticket["amount"]))
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected!</b>\n\n"
         f"💰 <b>Amount:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
@@ -1723,6 +1740,8 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
     except Exception:
         pass
     reply_text = f"✅ Ticket #{tid} rejected. User notified."
+    if msg_obj is None:
+        return
     if isinstance(msg_obj, Message):
         await msg_obj.answer(reply_text, reply_markup=generate_admin_dashboard())
     else:
@@ -1838,6 +1857,7 @@ async def process_rm_channel_action(callback: CallbackQuery):
 # redeploy — as long as the underlying process/server itself stays alive.
 # ─────────────────────────────────────────────────────────────────────────────
 _polling_task: asyncio.Task | None = None
+BOT_USERNAME: str = ""
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
@@ -2167,8 +2187,13 @@ async def process_full_unban_execute(message: Message, state: FSMContext):
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def application_lifespan(app: FastAPI):
-    global _polling_task
+    global _polling_task, BOT_USERNAME
     await DataEngine.init_database()
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+    except Exception:
+        logger.warning("[STARTUP] Could not fetch bot username yet.")
 
     async def _run_polling():
         try:
@@ -2191,6 +2216,458 @@ api_platform.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MINI APP REST API
+#
+# Everything below is what the two frontend pages (index.html = verify
+# screen, app.html = dashboard/admin) actually call over HTTP. None of this
+# existed before — the FastAPI app had middleware + lifespan but zero
+# routes, so every Mini App request was a silent 404.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BaseAuthBody(BaseModel):
+    initData: str = ""
+    class Config:
+        extra = "allow"
+
+async def _authed_uid(body: BaseAuthBody) -> int:
+    tg_user = parse_telegram_webapp_handshake(body.initData)
+    if not tg_user or "id" not in tg_user:
+        raise HTTPException(status_code=401, detail="invalid_session")
+    return int(tg_user["id"])
+
+async def _authed_admin_uid(body: BaseAuthBody) -> int:
+    uid = await _authed_uid(body)
+    if not evaluate_admin_access(uid):
+        raise HTTPException(status_code=403, detail="not_admin")
+    return uid
+
+async def _ensure_user_ok(uid: int, tg_user: dict | None = None):
+    acc = await DataEngine.get_user(uid)
+    if not acc:
+        uname = (tg_user or {}).get("username", "")
+        fname = f"{(tg_user or {}).get('first_name','')} {(tg_user or {}).get('last_name','')}".strip()
+        await DataEngine.create_user(uid, uname, fname)
+        return
+    if acc["is_banned"]:
+        raise HTTPException(status_code=403, detail="banned")
+
+async def _get_bot_username() -> str:
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+    return BOT_USERNAME
+
+# ── VERIFY (called from index.html) ────────────────────────────────────────
+class VerifyBody(BaseAuthBody):
+    uid: int
+    refId: int = 0
+    msgId: int = 0
+    ua: str = ""
+    fingerprint: str = ""
+    canvasHash: str = ""
+    webglHash: str = ""
+    screenSig: str = ""
+    tgPlatform: str = ""
+    tgVersion: str = ""
+    tgAppVersion: str = ""
+
+@api_platform.post("/api/verify")
+async def api_verify(body: VerifyBody, request: Request):
+    tg_user = parse_telegram_webapp_handshake(body.initData)
+    if not tg_user or int(tg_user.get("id", 0)) != body.uid:
+        return JSONResponse(status_code=400, content={"status": "blocked", "reason": "no_fingerprint"})
+
+    uid = body.uid
+    ip  = extract_real_ip(request)
+
+    if not await verify_limiter.is_allowed(f"verify:{uid}"):
+        return JSONResponse(status_code=429, content={"status": "blocked", "reason": "ip_cooldown"})
+
+    if await DataEngine.is_verified(uid):
+        return {"status": "already_verified"}
+
+    acc = await DataEngine.get_user(uid)
+    if acc and acc["is_banned"]:
+        return {"status": "blocked", "reason": "banned_ip"}
+
+    if await DataEngine.is_ip_banned(ip):
+        return {"status": "blocked", "reason": "banned_ip"}
+
+    on_cooldown, _remaining = await ip_cooldown.is_on_cooldown(ip)
+    if on_cooldown:
+        return {"status": "blocked", "reason": "ip_cooldown"}
+
+    if await execute_network_vpn_lookup(ip):
+        return {"status": "blocked", "reason": "vpn"}
+
+    ref = body.refId if (body.refId and body.refId != uid) else 0
+    uname = tg_user.get("username", "") or ""
+    fname = f"{tg_user.get('first_name','')} {tg_user.get('last_name','')}".strip()
+
+    should_ban, reason = await evaluate_clone_risk(
+        new_user_id=uid, referrer_id=ref, client_ip=ip,
+        fingerprint=body.fingerprint, tg_platform=body.tgPlatform,
+        tg_version=body.tgVersion, tg_app_version=body.tgAppVersion,
+        canvas_hash=body.canvasHash, webgl_hash=body.webglHash,
+        screen_sig=body.screenSig,
+    )
+    if should_ban:
+        await DataEngine.create_user(uid, uname, fname)
+        await DataEngine.ban_user(uid, 1)
+        await DataEngine.log_fraud_attempt(uid, reason, ip)
+        if reason == "ip_farm":
+            await DataEngine.ban_ip(ip, reason)
+        return {"status": "blocked", "reason": reason}
+
+    await DataEngine.create_user(uid, uname, fname, referred_by=(ref or None))
+    await DataEngine.save_verification(
+        uid, ip, body.ua, body.fingerprint, referrer_ip="",
+        tg_platform=body.tgPlatform, tg_version=body.tgVersion, tg_app_version=body.tgAppVersion,
+        canvas_hash=body.canvasHash, webgl_hash=body.webglHash, screen_sig=body.screenSig,
+    )
+    await ip_cooldown.mark_verified(ip)
+
+    if ref:
+        rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+        await DataEngine.add_balance(ref, rate)
+        try:
+            await bot.send_message(ref, f"🎉 New referral joined! +{rate:.2f} Birr credited.")
+        except Exception:
+            pass
+
+    if body.msgId:
+        try:
+            await bot.delete_message(chat_id=uid, message_id=body.msgId)
+        except Exception:
+            pass
+    try:
+        await bot.send_message(uid, "✅ Identity clear! Welcome.", reply_markup=generate_dashboard_matrix(uid))
+    except Exception:
+        pass
+
+    return {"status": "verified"}
+
+# ── ME / DASHBOARD (app.html) ───────────────────────────────────────────────
+@api_platform.post("/api/me")
+async def api_me(body: BaseAuthBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid, parse_telegram_webapp_handshake(body.initData))
+    acc = await DataEngine.get_user(uid)
+    direct, tier2 = await DataEngine.get_referral_metrics(uid)
+    rate  = float(await DataEngine.get_setting("reward_per_referral", "10"))
+    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    uname = await _get_bot_username()
+    return {
+        "balance": float(acc["balance"]),
+        "is_admin": evaluate_admin_access(uid),
+        "referrals": direct,
+        "tier2_referrals": tier2,
+        "reward_per_referral": rate,
+        "total_earned_refs": direct * rate,
+        "min_withdrawal": min_w,
+        "referral_link": f"https://t.me/{uname}?start={uid}",
+    }
+
+# ── TASKS ────────────────────────────────────────────────────────────────────
+class TaskActionBody(BaseAuthBody):
+    task_id: int
+
+@api_platform.post("/api/tasks")
+async def api_tasks(body: BaseAuthBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    tasks    = await DataEngine.get_tasks(active_only=True)
+    progress = await DataEngine.get_all_task_progress_for_user(uid)
+    now = datetime.utcnow()
+    out = []
+    for t in tasks:
+        p = progress.get(t["id"])
+        if p is None:
+            status, wait_left = "available", 0
+        elif p["status"] == "completed":
+            status, wait_left = "completed", 0
+        else:
+            try:
+                joined_at = datetime.fromisoformat(p["joined_at"])
+                elapsed = (now - joined_at).total_seconds()
+            except Exception:
+                elapsed = TASK_JOIN_WAIT_SECONDS
+            remaining = max(0, int(TASK_JOIN_WAIT_SECONDS - elapsed))
+            status = "claimable" if remaining <= 0 else "waiting"
+            wait_left = remaining
+        out.append({
+            "id": t["id"], "title": t["title"], "reward": float(t["reward"]),
+            "task_type": t["task_type"], "invite_link": t["invite_link"],
+            "status": status, "wait_left": wait_left,
+        })
+    return {"tasks": out}
+
+@api_platform.post("/api/tasks/join")
+async def api_tasks_join(body: TaskActionBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    task = await DataEngine.get_task(body.task_id)
+    if not task or not task["is_active"]:
+        raise HTTPException(status_code=404, detail="not_found")
+    await DataEngine.mark_task_joined(uid, body.task_id)
+    return {"wait_seconds": TASK_JOIN_WAIT_SECONDS}
+
+@api_platform.post("/api/tasks/claim")
+async def api_tasks_claim(body: TaskActionBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    task = await DataEngine.get_task(body.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="not_found")
+    progress = await DataEngine.get_task_progress(uid, body.task_id)
+    if not progress or progress["status"] == "completed":
+        raise HTTPException(status_code=400, detail="not_joined")
+    try:
+        joined_at = datetime.fromisoformat(progress["joined_at"])
+        elapsed = (datetime.utcnow() - joined_at).total_seconds()
+    except Exception:
+        elapsed = TASK_JOIN_WAIT_SECONDS
+    remaining = int(TASK_JOIN_WAIT_SECONDS - elapsed)
+    if remaining > 0:
+        raise HTTPException(status_code=400, detail=f"wait:{remaining}")
+    if task["task_type"] == "force" and task["channel_id"]:
+        try:
+            m = await bot.get_chat_member(chat_id=task["channel_id"], user_id=uid)
+            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                raise HTTPException(status_code=400, detail="not_member")
+        except HTTPException:
+            raise
+        except Exception:
+            logger.warning(f"[TASK] Could not verify membership for task={task['id']} user={uid} — allowing through.")
+    await DataEngine.mark_task_completed(uid, body.task_id)
+    reward = float(task["reward"])
+    await DataEngine.add_balance(uid, reward)
+    acc = await DataEngine.get_user(uid)
+    return {"status": "completed", "reward": reward, "balance": float(acc["balance"])}
+
+# ── WITHDRAW ─────────────────────────────────────────────────────────────────
+class WithdrawBody(BaseAuthBody):
+    amount: float
+    phone: str
+    full_name: str
+
+@api_platform.post("/api/withdraw")
+async def api_withdraw(body: WithdrawBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    if body.amount < min_w:
+        raise HTTPException(status_code=400, detail="below_minimum")
+    if len(body.phone.strip()) < 9:
+        raise HTTPException(status_code=400, detail="invalid_phone")
+    if len(body.full_name.strip()) < 3:
+        raise HTTPException(status_code=400, detail="invalid_name")
+    result = await dispatch_withdrawal_core(uid, round(body.amount, 2), body.full_name.strip(), body.phone.strip())
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail="insufficient_funds")
+    return {"status": "submitted", "ticket_id": result["ticket_id"]}
+
+@api_platform.post("/api/withdraw/history")
+async def api_withdraw_history(body: BaseAuthBody):
+    uid = await _authed_uid(body)
+    rows = await DataEngine.get_user_withdrawals(uid)
+    return {"withdrawals": [
+        {"amount": float(r["amount"]), "status": r["status"], "created_at": r["created_at"]}
+        for r in rows
+    ]}
+
+# ── ADMIN: TASKS ─────────────────────────────────────────────────────────────
+class IdBody(BaseAuthBody):
+    id: int
+
+class AdminTaskCreateBody(BaseAuthBody):
+    title: str
+    task_type: str
+    channel_id: str = ""
+    invite_link: str = ""
+    reward: float = 0
+
+class AdminTaskUpdateBody(BaseAuthBody):
+    id: int
+    is_active: Optional[int] = None
+
+class ReorderBody(BaseAuthBody):
+    order: List[int]
+
+@api_platform.post("/api/admin/tasks/list")
+async def api_admin_tasks_list(body: BaseAuthBody):
+    await _authed_admin_uid(body)
+    tasks = await DataEngine.get_tasks(active_only=False)
+    return {"tasks": [dict(t) for t in tasks]}
+
+@api_platform.post("/api/admin/tasks/create")
+async def api_admin_tasks_create(body: AdminTaskCreateBody):
+    await _authed_admin_uid(body)
+    tid = await DataEngine.create_task(body.title, body.channel_id, body.invite_link, body.task_type, body.reward)
+    return {"id": tid}
+
+@api_platform.post("/api/admin/tasks/delete")
+async def api_admin_tasks_delete(body: IdBody):
+    await _authed_admin_uid(body)
+    await DataEngine.delete_task(body.id)
+    return {"ok": True}
+
+@api_platform.post("/api/admin/tasks/update")
+async def api_admin_tasks_update(body: AdminTaskUpdateBody):
+    await _authed_admin_uid(body)
+    fields = {}
+    if body.is_active is not None:
+        fields["is_active"] = body.is_active
+    await DataEngine.update_task(body.id, **fields)
+    return {"ok": True}
+
+@api_platform.post("/api/admin/tasks/reorder")
+async def api_admin_tasks_reorder(body: ReorderBody):
+    await _authed_admin_uid(body)
+    await DataEngine.reorder_tasks(body.order)
+    return {"ok": True}
+
+# ── ADMIN: GATE CHANNELS ─────────────────────────────────────────────────────
+class AdminChannelCreateBody(BaseAuthBody):
+    bot_added: int
+    channel_id: str = ""
+    channel_name: str
+    invite_link: str
+
+@api_platform.post("/api/admin/channels/list")
+async def api_admin_channels_list(body: BaseAuthBody):
+    await _authed_admin_uid(body)
+    channels = await DataEngine.get_force_channels()
+    return {"channels": [dict(c) for c in channels]}
+
+@api_platform.post("/api/admin/channels/create")
+async def api_admin_channels_create(body: AdminChannelCreateBody):
+    await _authed_admin_uid(body)
+    cid = body.channel_id.strip()
+    if body.bot_added == 1 and not cid:
+        cid = "fake_" + hashlib.md5(body.invite_link.encode()).hexdigest()[:8]
+    await DataEngine.add_force_channel(cid, body.channel_name, body.invite_link, bot_added=body.bot_added)
+    return {"ok": True}
+
+@api_platform.post("/api/admin/channels/delete")
+async def api_admin_channels_delete(body: IdBody):
+    await _authed_admin_uid(body)
+    await DataEngine.remove_force_channel(body.id)
+    return {"ok": True}
+
+# ── ADMIN: WITHDRAWALS ───────────────────────────────────────────────────────
+class RejectBody(BaseAuthBody):
+    id: int
+    reason: str = "Violated bot usage policies."
+
+@api_platform.post("/api/admin/withdrawals/list")
+async def api_admin_withdrawals_list(body: BaseAuthBody):
+    await _authed_admin_uid(body)
+    rows = await DataEngine.get_pending_withdrawals()
+    return {"withdrawals": [dict(r) for r in rows]}
+
+@api_platform.post("/api/admin/withdrawals/approve")
+async def api_admin_withdrawals_approve(body: IdBody):
+    await _authed_admin_uid(body)
+    result = await approve_withdrawal_core(body.id)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return {"ok": True}
+
+@api_platform.post("/api/admin/withdrawals/reject")
+async def api_admin_withdrawals_reject(body: RejectBody):
+    await _authed_admin_uid(body)
+    ticket = await DataEngine.get_withdrawal(body.id)
+    if not ticket or ticket["status"] != "pending":
+        raise HTTPException(status_code=400, detail="already_processed")
+    await execute_withdrawal_rejection(None, body.id, ticket, body.reason)
+    return {"ok": True}
+
+# ── ADMIN: USERS ─────────────────────────────────────────────────────────────
+class UserIdBody(BaseAuthBody):
+    user_id: int
+
+class BanBody(BaseAuthBody):
+    user_id: int
+    banned: int
+
+class BalanceAdjustBody(BaseAuthBody):
+    user_id: int
+    amount: float
+
+@api_platform.post("/api/admin/users/search")
+async def api_admin_users_search(body: UserIdBody):
+    await _authed_admin_uid(body)
+    user = await DataEngine.get_user(body.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="not_found")
+    direct, _tier2 = await DataEngine.get_referral_metrics(body.user_id)
+    return {
+        "full_name": user["full_name"] or "",
+        "username": user["username"] or "",
+        "balance": float(user["balance"]),
+        "referrals": direct,
+        "is_banned": user["is_banned"],
+    }
+
+@api_platform.post("/api/admin/users/ban")
+async def api_admin_users_ban(body: BanBody):
+    await _authed_admin_uid(body)
+    await DataEngine.ban_user(body.user_id, body.banned)
+    if body.banned:
+        try:
+            await bot.send_message(body.user_id, "🚫 <b>Your account has been banned from this bot.</b>")
+        except Exception:
+            pass
+    return {"ok": True}
+
+@api_platform.post("/api/admin/users/balance")
+async def api_admin_users_balance(body: BalanceAdjustBody):
+    await _authed_admin_uid(body)
+    await DataEngine.add_balance(body.user_id, body.amount)
+    return {"ok": True}
+
+# ── ADMIN: SETTINGS ──────────────────────────────────────────────────────────
+class SettingsUpdateBody(BaseAuthBody):
+    reward_per_referral: float
+    min_withdrawal: float
+
+@api_platform.post("/api/admin/settings")
+async def api_admin_settings(body: BaseAuthBody):
+    await _authed_admin_uid(body)
+    reward = await DataEngine.get_setting("reward_per_referral", "10")
+    min_w  = await DataEngine.get_setting("min_withdrawal", "50")
+    return {"reward_per_referral": float(reward), "min_withdrawal": float(min_w)}
+
+@api_platform.post("/api/admin/settings/update")
+async def api_admin_settings_update(body: SettingsUpdateBody):
+    await _authed_admin_uid(body)
+    await DataEngine.set_setting("reward_per_referral", str(body.reward_per_referral))
+    await DataEngine.set_setting("min_withdrawal", str(body.min_withdrawal))
+    return {"ok": True}
+
+# ── ADMIN: BROADCAST ─────────────────────────────────────────────────────────
+class BroadcastBody(BaseAuthBody):
+    text: str
+
+@api_platform.post("/api/admin/broadcast")
+async def api_admin_broadcast(body: BroadcastBody):
+    await _authed_admin_uid(body)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        nodes = await cur.fetchall()
+    sent, failed = 0, 0
+    for (target_uid,) in nodes:
+        try:
+            await bot.send_message(target_uid, body.text)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    return {"sent": sent, "failed": failed}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
