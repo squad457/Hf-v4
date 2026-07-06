@@ -293,7 +293,6 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   </div>
   <div class="splash-word">HF <span>EARN V4</span></div>
   <div class="splash-track"><i></i></div>
-  <div class="splash-sub">Securing your session…</div>
 </div>
 
 <div id="gate" style="display:none">
@@ -718,7 +717,11 @@ let adminSubTab = "tasks";
 
 async function renderAdmin(view){
   view.innerHTML = `
-    <h2 class="sect">Admin Control Center</h2>
+    <h2 class="sect" style="margin-top:0">Admin Control Center</h2>
+    <div class="card stat-row" id="adminStatRow" style="margin-bottom:14px">
+      <div class="stat-box"><div class="n" id="statTotal">—</div><div class="l">Total Users</div></div>
+      <div class="stat-box"><div class="n" id="statOnline">—</div><div class="l">Online Now</div></div>
+    </div>
     <div class="admin-nav" id="adminNav">
       <button data-t="tasks" class="active">Tasks</button>
       <button data-t="channels">Gate Channels</button>
@@ -736,7 +739,18 @@ async function renderAdmin(view){
     adminSubTab = b.dataset.t;
     paintAdminBody();
   });
+  loadAdminOverview();
   await paintAdminBody();
+}
+
+async function loadAdminOverview(){
+  try {
+    const s = await api("/api/admin/stats/overview");
+    const elT = document.getElementById("statTotal");
+    const elO = document.getElementById("statOnline");
+    if (elT) elT.textContent = s.total_users;
+    if (elO) elO.textContent = s.online_users;
+  } catch (e) { /* non-fatal — stats are a nice-to-have */ }
 }
 
 async function paintAdminBody(){
