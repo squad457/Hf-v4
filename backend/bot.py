@@ -2194,4 +2194,6 @@ api_platform.add_middleware(
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    u
+    uvicorn.run(api_platform, host="0.0.0.0", port=port)
+
+# ───────────────────────────────────────────────────────────────────────────
