@@ -2311,6 +2311,136 @@ async def health_check():
     return {"ok": True}
 
 
+# ── /api/verify — identity/fingerprint verification (index.html) ────────
+#
+# CRITICAL FIX #2: this endpoint was ALSO completely missing. It's not
+# part of the app.html contract — it's the fraud-detection intake used by
+# index.html (the "Security Check" screen linked from generate_verifica-
+# tion_widget()). This is where evaluate_clone_risk(), the IP cooldown,
+# the VPN check, and the referral payout all actually run. Without this
+# route, /start would send a "Verify identity" button whose Mini App link
+# posted to /api/verify and got a 404 forever — which is exactly what
+# showed up in the Railway logs.
+#
+# Response contract (matches index.html exactly):
+#   200 {"status": "verified"}            → new account created & passed
+#   200 {"status": "already_verified"}     → idempotent replay of an old link
+#   200 {"status": "blocked", "reason": X} → soft or hard block, NOT an
+#                                            HTTP error (index.html only
+#                                            treats non-2xx as "server
+#                                            error", so blocks must be 200)
+#   429                                    → per-user rate limit hit
+class VerifyRequest(BaseModel):
+    uid: int
+    refId: int = 0
+    msgId: int = 0
+    initData: str = ""
+    ua: str = ""
+    fingerprint: str = ""
+    canvasHash: str = ""
+    webglHash: str = ""
+    screenSig: str = ""
+    tgPlatform: str = ""
+    tgVersion: str = ""
+    tgAppVersion: str = ""
+
+
+@api_app.post("/api/verify")
+async def api_verify(body: VerifyRequest, request: Request):
+    # The uid comes from a URL query param on index.html (?uid=...), which
+    # is user-editable — so it must be cross-checked against the
+    # cryptographically signed initData, which always reflects whoever is
+    # ACTUALLY logged into the current Telegram session.
+    tg_user = parse_telegram_webapp_handshake(body.initData)
+    if not tg_user or "id" not in tg_user or int(tg_user["id"]) != body.uid:
+        raise HTTPException(status_code=401, detail="invalid_init_data")
+
+    uid = body.uid
+    ref = body.refId if body.refId and body.refId != uid else 0
+
+    if await DataEngine.is_verified(uid):
+        return {"status": "already_verified"}
+
+    if not await verify_limiter.is_allowed(str(uid)):
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+
+    client_ip = extract_real_ip(request)
+
+    on_cooldown, remaining = await ip_cooldown.is_on_cooldown(client_ip)
+    if on_cooldown:
+        return {"status": "blocked", "reason": "ip_cooldown", "retry_after": remaining}
+
+    fp_ok = bool(body.fingerprint) and body.fingerprint not in ("undefined", "null", "")
+    if not fp_ok:
+        return {"status": "blocked", "reason": "no_fingerprint"}
+
+    if await DataEngine.is_ip_banned(client_ip):
+        await DataEngine.log_fraud_attempt(uid, "banned_ip_attempt", client_ip)
+        return {"status": "blocked", "reason": "banned_ip"}
+
+    if await execute_network_vpn_lookup(client_ip):
+        return {"status": "blocked", "reason": "vpn"}
+
+    should_ban, reason = await evaluate_clone_risk(
+        uid, ref, client_ip, body.fingerprint,
+        body.tgPlatform, body.tgVersion, body.tgAppVersion,
+        body.canvasHash, body.webglHash, body.screenSig,
+    )
+    if should_ban:
+        await DataEngine.log_fraud_attempt(uid, reason, client_ip, "auto-blocked at verification")
+        if reason == "ip_farm":
+            await DataEngine.ban_ip(client_ip, reason)
+        return {"status": "blocked", "reason": reason}
+
+    # Passed every check — create the account (linking the referrer only
+    # on first creation), save the verification fingerprint, start the IP
+    # cooldown window, and pay the referrer's bonus.
+    referrer_row = await DataEngine.get_user(ref) if ref else None
+    referred_by = ref if referrer_row else None
+
+    existing = await DataEngine.get_user(uid)
+    if not existing:
+        full_name = (
+            f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip()
+            or tg_user.get("username", "") or str(uid)
+        )
+        await DataEngine.create_user(uid, tg_user.get("username", "") or "", full_name, referred_by)
+
+    await DataEngine.save_verification(
+        uid, client_ip, body.ua, body.fingerprint,
+        referrer_ip="", tg_platform=body.tgPlatform, tg_version=body.tgVersion,
+        tg_app_version=body.tgAppVersion, canvas_hash=body.canvasHash,
+        webgl_hash=body.webglHash, screen_sig=body.screenSig,
+    )
+    await ip_cooldown.mark_verified(client_ip)
+
+    if referred_by:
+        rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+        await DataEngine.add_balance(referred_by, rate)
+        try:
+            await bot.send_message(
+                referred_by,
+                f"🎉 Someone joined using your referral link! +{rate:.2f} Birr credited to your balance."
+            )
+        except Exception:
+            pass
+
+    if body.msgId:
+        try:
+            await bot.delete_message(chat_id=uid, message_id=body.msgId)
+        except Exception:
+            pass
+    try:
+        await bot.send_message(
+            uid, "✅ <b>Verified!</b> Welcome in.",
+            reply_markup=generate_dashboard_matrix(uid)
+        )
+    except Exception:
+        pass
+
+    return {"status": "verified"}
+
+
 # ── /api/me ──────────────────────────────────────────────────────────────
 @api_app.post("/api/me")
 async def api_me(body: ApiBase):
