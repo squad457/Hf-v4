@@ -2189,4 +2189,582 @@ async def process_full_unban_execute(message: Message, state: FSMContext):
     try:
         target = int(message.text.strip())
         # IMPORTANT: inject_fake_verification() writes straight into the
-        # verifications table, which makes is_verified(target)=True ev
+        # verifications table, which makes is_verified(target)=True even
+        # though the user never actually completed the Mini App fingerprint
+        # flow. This is intentionally scoped to ONLY the target user_id
+        # passed in here — it must never be applied in bulk, since it
+        # bypasses fraud/fingerprint checks for whoever it's used on.
+        await DataEngine.ban_user(target, 0)
+        await DataEngine.inject_fake_verification(target)
+        await state.clear()
+        await message.answer(
+            f"🔥 Full Unban done. User <code>{target}</code> is unbanned and "
+            f"marked verified — they will NOT be asked to open the Mini App again.",
+            reply_markup=generate_admin_dashboard()
+        )
+    except ValueError:
+        await message.answer("❌ Invalid ID.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# WIRING — attach all @core_router handlers to the Dispatcher
+#
+# CRITICAL FIX: this call was missing entirely. Every @core_router.message
+# and @core_router.callback_query handler defined above (process_start_
+# command, the whole admin panel, withdrawals, everything) was NEVER
+# reachable, because a Router only does anything once it's registered on
+# the Dispatcher that's actually polling Telegram.
+# ═════════════════════════════════════════════════════════════════════════
+dp.include_router(core_router)
+
+# ═════════════════════════════════════════════════════════════════════════
+# WEB API — Mini App REST backend (FastAPI)
+#
+# CRITICAL FIX: fastapi/uvicorn were imported at the top of this file and
+# referenced in comments ("...the Mini App REST endpoint (/api/withdraw)")
+# as if this layer already existed, but no FastAPI app, no routes, and no
+# uvicorn server were ever defined anywhere in the file. frontend/app.html
+# was written entirely against this contract, so none of it could work
+# until now.
+#
+# Every route is called by app.html's api() helper, which POSTs
+# { initData, ...extra } as JSON. initData is Telegram's signed WebApp
+# payload — validated below via parse_telegram_webapp_handshake() so a
+# user cannot spoof another user's Telegram ID from the browser.
+# ═════════════════════════════════════════════════════════════════════════
+api_app = FastAPI()
+
+api_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ApiBase(BaseModel):
+    initData: str = ""
+
+
+async def _authenticate(body: ApiBase) -> dict:
+    """Validates Telegram WebApp initData and returns the users-table row
+    as a plain dict. Creates the user row on first contact (mirrors what
+    /start does on the bot side) and bumps last_seen for the online-users
+    stat. Raises 401 for a bad signature and 403 for a banned account."""
+    tg_user = parse_telegram_webapp_handshake(body.initData)
+    if not tg_user or "id" not in tg_user:
+        raise HTTPException(status_code=401, detail="invalid_init_data")
+    user_id = int(tg_user["id"])
+    row = await DataEngine.get_user(user_id)
+    if not row:
+        full_name = (
+            f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip()
+            or tg_user.get("username", "") or str(user_id)
+        )
+        await DataEngine.create_user(user_id, tg_user.get("username", "") or "", full_name)
+        row = await DataEngine.get_user(user_id)
+    await DataEngine.touch_last_seen(user_id)
+    if row["is_banned"]:
+        raise HTTPException(status_code=403, detail="banned")
+    return dict(row)
+
+
+def _require_admin(user: dict):
+    if not evaluate_admin_access(user["user_id"]):
+        raise HTTPException(status_code=403, detail="not_admin")
+
+
+async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup | None = None) -> tuple[int, int]:
+    """Shared broadcast sender — used by /api/admin/broadcast (free-text
+    announcements) and /api/admin/tasks/broadcast (new-task announcements
+    with an Open App button)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        rows = await cur.fetchall()
+    sent, failed = 0, 0
+    for (uid,) in rows:
+        try:
+            await bot.send_message(uid, text, reply_markup=reply_markup)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            err_str = str(e)
+            if "RetryAfter" in err_str:
+                try:
+                    wait = int("".join(filter(str.isdigit, err_str))) + 1
+                except Exception:
+                    wait = 30
+                await asyncio.sleep(wait)
+                try:
+                    await bot.send_message(uid, text, reply_markup=reply_markup)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            else:
+                failed += 1
+    return sent, failed
+
+
+@api_app.get("/health")
+async def health_check():
+    return {"ok": True}
+
+
+# ── /api/me ──────────────────────────────────────────────────────────────
+@api_app.post("/api/me")
+async def api_me(body: ApiBase):
+    user = await _authenticate(body)
+    direct, _ = await DataEngine.get_referral_metrics(user["user_id"])
+    rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    return {
+        "user_id": user["user_id"],
+        "balance": float(user["balance"]),
+        "referrals": direct,
+        "reward_per_referral": rate,
+        "min_withdrawal": min_w,
+        "total_earned_refs": round(direct * rate, 2),
+        "is_admin": evaluate_admin_access(user["user_id"]),
+    }
+
+
+# ── /api/gate/* — force-join gate ────────────────────────────────────────
+@api_app.post("/api/gate/status")
+async def api_gate_status(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    force_unjoined = []
+    if not evaluate_admin_access(uid):
+        force_unjoined = await inspect_compulsory_memberships(uid)
+    all_channels = await DataEngine.get_force_channels()
+    fake_channels = [dict(c) for c in all_channels if c["bot_added"] == 1]
+    fake_seen = await DataEngine.has_seen_fake_join(uid)
+    return {
+        "force_unjoined": [dict(c) for c in force_unjoined],
+        "fake_channels": fake_channels,
+        "fake_seen": fake_seen,
+    }
+
+
+@api_app.post("/api/gate/fake_seen")
+async def api_gate_fake_seen(body: ApiBase):
+    user = await _authenticate(body)
+    await DataEngine.mark_fake_join_seen(user["user_id"])
+    return {"ok": True}
+
+
+# ── /api/tasks — user-facing task list + join/check/claim ───────────────
+async def _build_task_view(user_id: int) -> list:
+    tasks = await DataEngine.get_tasks(active_only=True)
+    progress = await DataEngine.get_all_task_progress_for_user(user_id)
+    out = []
+    for row in tasks:
+        t = dict(row)
+        p = progress.get(t["id"])
+        if p is None:
+            t["status"] = "none"
+        elif p["status"] == "completed":
+            t["status"] = "completed"
+        else:
+            try:
+                joined_dt = datetime.strptime(p["joined_at"], "%Y-%m-%d %H:%M:%S")
+                elapsed = (datetime.utcnow() - joined_dt).total_seconds()
+            except Exception:
+                elapsed = TASK_JOIN_WAIT_SECONDS
+            wait_left = max(0, int(TASK_JOIN_WAIT_SECONDS - elapsed))
+            t["status"] = "waiting" if wait_left > 0 else "claimable"
+            t["wait_left"] = wait_left
+        out.append(t)
+    return out
+
+
+@api_app.post("/api/tasks")
+async def api_tasks(body: ApiBase):
+    user = await _authenticate(body)
+    return {"tasks": await _build_task_view(user["user_id"])}
+
+
+class TaskActionRequest(ApiBase):
+    task_id: int
+
+
+@api_app.post("/api/tasks/join")
+async def api_tasks_join(body: TaskActionRequest):
+    user = await _authenticate(body)
+    task = await DataEngine.get_task(body.task_id)
+    if not task or not task["is_active"]:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    await DataEngine.mark_task_joined(user["user_id"], body.task_id)
+    return {"wait_seconds": TASK_JOIN_WAIT_SECONDS}
+
+
+@api_app.post("/api/tasks/check")
+async def api_tasks_check(body: TaskActionRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    task = await DataEngine.get_task(body.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    prog = await DataEngine.get_task_progress(uid, body.task_id)
+    if not prog:
+        raise HTTPException(status_code=400, detail="not_joined")
+    try:
+        joined_dt = datetime.strptime(prog["joined_at"], "%Y-%m-%d %H:%M:%S")
+        elapsed = (datetime.utcnow() - joined_dt).total_seconds()
+    except Exception:
+        elapsed = TASK_JOIN_WAIT_SECONDS
+    remaining = int(TASK_JOIN_WAIT_SECONDS - elapsed)
+    if remaining > 0:
+        raise HTTPException(status_code=400, detail=f"wait:{remaining}")
+    if task["task_type"] == "force" and task["channel_id"]:
+        try:
+            m = await bot.get_chat_member(chat_id=task["channel_id"], user_id=uid)
+            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                raise HTTPException(status_code=400, detail="not_member")
+        except HTTPException:
+            raise
+        except Exception:
+            # Bot isn't admin there / lookup failed — don't hard-block a
+            # legitimate user over a misconfigured channel (same policy
+            # as inspect_compulsory_memberships above).
+            pass
+    return {"ok": True}
+
+
+@api_app.post("/api/tasks/claim")
+async def api_tasks_claim(body: TaskActionRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    task = await DataEngine.get_task(body.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    prog = await DataEngine.get_task_progress(uid, body.task_id)
+    if not prog or prog["status"] == "completed":
+        raise HTTPException(status_code=400, detail="not_claimable")
+    await DataEngine.mark_task_completed(uid, body.task_id)
+    await DataEngine.add_balance(uid, float(task["reward"]))
+    fresh = await DataEngine.get_user(uid)
+    return {"status": "completed", "reward": float(task["reward"]), "balance": float(fresh["balance"])}
+
+
+# ── /api/withdraw ─────────────────────────────────────────────────────────
+class WithdrawRequest(ApiBase):
+    amount: float
+    phone: str
+    full_name: str
+
+
+@api_app.post("/api/withdraw")
+async def api_withdraw(body: WithdrawRequest):
+    user = await _authenticate(body)
+    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    if body.amount < min_w:
+        raise HTTPException(status_code=400, detail=f"min_withdrawal_is_{min_w:.2f}")
+    result = await dispatch_withdrawal_core(
+        user["user_id"], body.amount, body.full_name.strip(), body.phone.strip()
+    )
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@api_app.post("/api/withdraw/history")
+async def api_withdraw_history(body: ApiBase):
+    user = await _authenticate(body)
+    rows = await DataEngine.get_user_withdrawals(user["user_id"])
+    return {"history": [dict(r) for r in rows]}
+
+
+# ── /api/admin/stats/overview — total & online users ─────────────────────
+@api_app.post("/api/admin/stats/overview")
+async def api_admin_stats_overview(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    total, online = await DataEngine.get_user_activity_stats()
+    return {"total_users": total, "online_users": online}
+
+
+# ── /api/admin/tasks/* ────────────────────────────────────────────────────
+@api_app.post("/api/admin/tasks/list")
+async def api_admin_tasks_list(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    tasks = await DataEngine.get_tasks(active_only=False)
+    return {"tasks": [dict(t) for t in tasks]}
+
+
+class AdminTaskCreateRequest(ApiBase):
+    title: str
+    task_type: str = "fake"
+    channel_id: str = ""
+    invite_link: str = ""
+    reward: float = 0
+
+
+@api_app.post("/api/admin/tasks/create")
+async def api_admin_tasks_create(body: AdminTaskCreateRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    if not body.title.strip():
+        raise HTTPException(status_code=400, detail="title_required")
+    task_id = await DataEngine.create_task(
+        body.title.strip(), body.channel_id.strip(), body.invite_link.strip(),
+        body.task_type, body.reward,
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+class AdminIdRequest(ApiBase):
+    id: int
+
+
+@api_app.post("/api/admin/tasks/delete")
+async def api_admin_tasks_delete(body: AdminIdRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.delete_task(body.id)
+    return {"ok": True}
+
+
+class AdminTaskUpdateRequest(ApiBase):
+    id: int
+    is_active: int
+
+
+@api_app.post("/api/admin/tasks/update")
+async def api_admin_tasks_update(body: AdminTaskUpdateRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.update_task(body.id, is_active=body.is_active)
+    return {"ok": True}
+
+
+class AdminTaskReorderRequest(ApiBase):
+    order: List[int]
+
+
+@api_app.post("/api/admin/tasks/reorder")
+async def api_admin_tasks_reorder(body: AdminTaskReorderRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.reorder_tasks(body.order)
+    return {"ok": True}
+
+
+# NEW FEATURE: after adding a task, the admin panel offers "Broadcast this
+# new task to all users?" — this endpoint sends that announcement with an
+# inline "Open App" button (a Telegram WebApp button) so users can jump
+# straight into the Mini App and do the task.
+class AdminTaskBroadcastRequest(ApiBase):
+    task_id: int
+
+
+@api_app.post("/api/admin/tasks/broadcast")
+async def api_admin_tasks_broadcast(body: AdminTaskBroadcastRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    task = await DataEngine.get_task(body.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    text = (
+        f"🆕 <b>አዲስ ታስክ አለ! / New Task Available!</b>\n\n"
+        f"📢 {sanitize_html(task['title'])}\n"
+        f"💰 Reward: <b>{float(task['reward']):.2f} Birr</b>\n\n"
+        f"👇 ገብታችሁ ስሩ! / Open the app and complete it now."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🚀 Open App / አፑን ክፈት",
+            web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html"),
+        )
+    ]])
+    sent, failed = await broadcast_to_all_users(text, markup)
+    return {"ok": True, "sent": sent, "failed": failed}
+
+
+# ── /api/admin/channels/* — force/fake gate channels ─────────────────────
+@api_app.post("/api/admin/channels/list")
+async def api_admin_channels_list(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    channels = await DataEngine.get_force_channels()
+    return {"channels": [dict(c) for c in channels]}
+
+
+class AdminChannelCreateRequest(ApiBase):
+    bot_added: int
+    channel_id: str = ""
+    channel_name: str
+    invite_link: str
+
+
+@api_app.post("/api/admin/channels/create")
+async def api_admin_channels_create(body: AdminChannelCreateRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    if not body.channel_name.strip() or not body.invite_link.strip():
+        raise HTTPException(status_code=400, detail="name_and_link_required")
+    await DataEngine.add_force_channel(
+        body.channel_id.strip(), body.channel_name.strip(), body.invite_link.strip(), body.bot_added
+    )
+    return {"ok": True}
+
+
+@api_app.post("/api/admin/channels/delete")
+async def api_admin_channels_delete(body: AdminIdRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.remove_force_channel(body.id)
+    return {"ok": True}
+
+
+# ── /api/admin/withdrawals/* ──────────────────────────────────────────────
+@api_app.post("/api/admin/withdrawals/list")
+async def api_admin_withdrawals_list(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    rows = await DataEngine.get_pending_withdrawals()
+    return {"withdrawals": [dict(r) for r in rows]}
+
+
+@api_app.post("/api/admin/withdrawals/approve")
+async def api_admin_withdrawals_approve(body: AdminIdRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    result = await approve_withdrawal_core(body.id)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return {"ok": True}
+
+
+class AdminWithdrawalRejectRequest(ApiBase):
+    id: int
+    reason: str = "No reason given."
+
+
+@api_app.post("/api/admin/withdrawals/reject")
+async def api_admin_withdrawals_reject(body: AdminWithdrawalRejectRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    ticket = await DataEngine.get_withdrawal(body.id)
+    if not ticket or ticket["status"] != "pending":
+        raise HTTPException(status_code=400, detail="already_processed")
+    await execute_withdrawal_rejection(None, body.id, ticket, body.reason)
+    return {"ok": True}
+
+
+# ── /api/admin/users/* ────────────────────────────────────────────────────
+class AdminUserIdRequest(ApiBase):
+    user_id: int
+
+
+@api_app.post("/api/admin/users/search")
+async def api_admin_users_search(body: AdminUserIdRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    target = await DataEngine.get_user(body.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="not_found")
+    direct, _ = await DataEngine.get_referral_metrics(body.user_id)
+    return {
+        "user_id": target["user_id"],
+        "username": target["username"],
+        "full_name": target["full_name"],
+        "balance": float(target["balance"]),
+        "referrals": direct,
+        "is_banned": bool(target["is_banned"]),
+    }
+
+
+class AdminUserBanRequest(ApiBase):
+    user_id: int
+    banned: int
+
+
+@api_app.post("/api/admin/users/ban")
+async def api_admin_users_ban(body: AdminUserBanRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.ban_user(body.user_id, body.banned)
+    return {"ok": True}
+
+
+class AdminUserBalanceRequest(ApiBase):
+    user_id: int
+    amount: float
+
+
+@api_app.post("/api/admin/users/balance")
+async def api_admin_users_balance(body: AdminUserBalanceRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.add_balance(body.user_id, body.amount)
+    return {"ok": True}
+
+
+# ── /api/admin/settings ───────────────────────────────────────────────────
+@api_app.post("/api/admin/settings")
+async def api_admin_settings(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    rate = await DataEngine.get_setting("reward_per_referral", "10")
+    min_w = await DataEngine.get_setting("min_withdrawal", "50")
+    return {"reward_per_referral": float(rate), "min_withdrawal": float(min_w)}
+
+
+class AdminSettingsUpdateRequest(ApiBase):
+    reward_per_referral: float
+    min_withdrawal: float
+
+
+@api_app.post("/api/admin/settings/update")
+async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    await DataEngine.set_setting("reward_per_referral", str(body.reward_per_referral))
+    await DataEngine.set_setting("min_withdrawal", str(body.min_withdrawal))
+    return {"ok": True}
+
+
+# ── /api/admin/broadcast — free-text announcement to all users ──────────
+class AdminBroadcastRequest(ApiBase):
+    text: str
+
+
+@api_app.post("/api/admin/broadcast")
+async def api_admin_broadcast(body: AdminBroadcastRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text_required")
+    sent, failed = await broadcast_to_all_users(body.text.strip())
+    return {"sent": sent, "failed": failed}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# ENTRYPOINT — runs the Telegram long-poller AND the Mini App web server
+# in the same process (this is what Railway's "web: python bot.py" and
+# healthcheckPath "/health" in railway.toml expect).
+# ═════════════════════════════════════════════════════════════════════════
+async def _run_web_server():
+    port = int(os.getenv("PORT", "8000"))
+    config = uvicorn.Config(api_app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def _main():
+    global _polling_task, BOT_USERNAME
+    await DataEngine.init_database()
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+    except Exception as e:
+        logger.warning(f"Could not fetch bot identity at startup: {e}")
+    _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    await _run_web_server()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
