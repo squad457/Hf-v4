@@ -2391,6 +2391,54 @@ async def api_me(body: BaseAuthBody):
         "referral_link": f"https://t.me/{uname}?start={uid}",
     }
 
+# ── GATE CHANNELS (Mini App entry) ───────────────────────────────────────────
+# 'force' channels (bot_added=0): the bot IS an admin there, so membership is
+# really checked via getChatMember. These block the Mini App dashboard until
+# joined, and can be re-checked ("I've Joined") — if the user left, they're
+# asked to join again.
+# 'fake' channels (bot_added=1): the bot can't verify membership, so these
+# are never used to block anything. They're surfaced once in the Tasks tab
+# as a simple "view/visit" item (fake_join_seen), never re-prompted.
+@api_platform.post("/api/gate/status")
+async def api_gate_status(body: BaseAuthBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    all_channels = await DataEngine.get_force_channels()
+    force_unjoined = []
+    fake_channels = []
+    for ch in all_channels:
+        if ch["bot_added"] == 1:
+            fake_channels.append({
+                "channel_id": ch["channel_id"], "channel_name": ch["channel_name"],
+                "invite_link": ch["invite_link"],
+            })
+            continue
+        try:
+            m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=uid)
+            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                force_unjoined.append({
+                    "channel_id": ch["channel_id"], "channel_name": ch["channel_name"],
+                    "invite_link": ch["invite_link"],
+                })
+        except Exception as e:
+            logger.warning(
+                f"[GATE] Could not verify membership for channel={ch['channel_id']} "
+                f"user={uid}: {e} — skipping (bot may not be admin there)."
+            )
+    fake_seen = await DataEngine.has_seen_fake_join(uid)
+    return {
+        "force_unjoined": force_unjoined,
+        "fake_channels": fake_channels,
+        "fake_seen": fake_seen,
+    }
+
+@api_platform.post("/api/gate/fake_seen")
+async def api_gate_fake_seen(body: BaseAuthBody):
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    await DataEngine.mark_fake_join_seen(uid)
+    return {"ok": True}
+
 # ── TASKS ────────────────────────────────────────────────────────────────────
 class TaskActionBody(BaseAuthBody):
     task_id: int
