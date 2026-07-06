@@ -2192,4 +2192,6 @@ api_platform.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# ───────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    u
