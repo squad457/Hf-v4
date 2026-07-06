@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Dashboard</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="config.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:#090d18;color:#dde4f0;font-family:'Inter',system-ui,-apple-system,sans-serif;
+  -webkit-font-smoothing:antialiased;padding-bottom:78px;min-height:100%;
+}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse 70% 40% at 50% -10%,rgba(56,120,255,.10) 0%,transparent 70%);
+}
+.wrap{position:relative;z-index:1;max-width:480px;margin:0 auto;padding:16px 14px 8px;}
+::-webkit-scrollbar{display:none}
+
+/* ── Header ─────────────────────────── */
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.brand{display:flex;align-items:center;gap:8px;font-weight:800;font-size:1.05rem;letter-spacing:-.02em;color:#eef2ff;}
+.brand .dot{width:8px;height:8px;border-radius:50%;background:#f5b942;box-shadow:0 0 10px rgba(245,185,66,.7);}
+.bal-chip{
+  display:flex;align-items:center;gap:6px;background:#0f1622;border:1px solid rgba(245,185,66,.25);
+  padding:7px 12px;border-radius:99px;font-weight:700;font-size:.82rem;color:#f5c86a;
+  font-variant-numeric:tabular-nums;
+}
+
+/* ── Cards ──────────────────────────── */
+.card{
+  background:#0f1622;border:1px solid rgba(255,255,255,.07);border-radius:18px;
+  padding:18px;margin-bottom:12px;box-shadow:0 12px 30px rgba(0,0,0,.35);
+}
+.hero{
+  background:linear-gradient(160deg,#131d33,#0d1220 70%);border:1px solid rgba(245,185,66,.18);
+  border-radius:20px;padding:22px 20px;margin-bottom:14px;position:relative;overflow:hidden;
+}
+.hero::after{
+  content:'';position:absolute;top:-40%;right:-20%;width:60%;height:140%;
+  background:radial-gradient(ellipse,rgba(245,185,66,.14),transparent 70%);pointer-events:none;
+}
+.hero .label{font-size:.72rem;color:#6a7ba3;text-transform:uppercase;letter-spacing:.08em;font-weight:700;}
+.hero .amount{font-size:2.3rem;font-weight:800;color:#fff;letter-spacing:-.03em;margin:4px 0 2px;font-variant-numeric:tabular-nums;}
+.hero .amount span{font-size:1.1rem;color:#f5c86a;font-weight:700;}
+.hero .sub{font-size:.76rem;color:#5a7090;}
+.stat-row{display:flex;gap:10px;margin-top:14px;}
+.stat-box{flex:1;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:10px 12px;}
+.stat-box .n{font-size:1.15rem;font-weight:800;color:#eef2ff;font-variant-numeric:tabular-nums;}
+.stat-box .l{font-size:.66rem;color:#5a7090;margin-top:1px;}
+
+h2.sect{font-size:.78rem;font-weight:800;color:#8ea2c9;text-transform:uppercase;letter-spacing:.07em;margin:18px 0 10px;}
+
+/* ── Buttons ────────────────────────── */
+.btn{
+  display:block;width:100%;text-align:center;padding:13px;border-radius:13px;border:none;
+  font-weight:700;font-size:.88rem;font-family:inherit;cursor:pointer;color:#fff;
+  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+}
+.btn:disabled{opacity:.45;cursor:default;}
+.btn.gold{background:linear-gradient(90deg,#b9781f,#f5b942);color:#1a1200;}
+.btn.ghost{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:#c0cfe8;}
+.btn.sm{padding:9px;font-size:.78rem;border-radius:10px;}
+.btn.danger{background:linear-gradient(90deg,#991b1b,#ef4444);}
+input,select,textarea{
+  width:100%;background:#0a0e18;border:1px solid rgba(255,255,255,.09);color:#dde4f0;
+  padding:11px 13px;border-radius:11px;font-size:.86rem;font-family:inherit;margin-bottom:10px;
+}
+input:focus,select:focus,textarea:focus{outline:none;border-color:rgba(56,120,255,.5);}
+label.f{font-size:.72rem;color:#6a7ba3;font-weight:700;margin-bottom:5px;display:block;}
+
+/* ── Task cards ─────────────────────── */
+.task{
+  display:flex;align-items:center;gap:12px;background:#0f1622;border:1px solid rgba(255,255,255,.07);
+  border-radius:15px;padding:13px 14px;margin-bottom:10px;
+}
+.task.completed{opacity:.55;}
+.task-ic{width:40px;height:40px;border-radius:11px;background:rgba(56,120,255,.12);display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;}
+.task-body{flex:1;min-width:0;}
+.task-title{font-size:.86rem;font-weight:700;color:#eef2ff;}
+.task-reward{font-size:.72rem;color:#f5c86a;font-weight:700;margin-top:2px;}
+.task-btn{
+  flex-shrink:0;padding:9px 14px;border-radius:10px;border:none;font-weight:700;font-size:.76rem;
+  cursor:pointer;font-family:inherit;min-width:78px;
+}
+.task-btn.join{background:linear-gradient(90deg,#1d4ed8,#3b82f6);color:#fff;}
+.task-btn.wait{background:rgba(255,255,255,.06);color:#7d8fb5;}
+.task-btn.claim{background:linear-gradient(90deg,#15803d,#22c55e);color:#fff;}
+.task-btn.done{background:rgba(34,197,94,.12);color:#4ade80;}
+
+/* ── Bottom nav ─────────────────────── */
+.navbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:5;
+  background:rgba(10,14,24,.92);backdrop-filter:blur(14px);border-top:1px solid rgba(255,255,255,.07);
+  display:flex;justify-content:space-around;padding:9px 6px calc(9px + env(safe-area-inset-bottom));
+}
+.nav-btn{
+  display:flex;flex-direction:column;align-items:center;gap:2px;background:none;border:none;
+  color:#5a6d90;font-family:inherit;font-size:.62rem;font-weight:700;cursor:pointer;padding:4px 8px;
+}
+.nav-btn .ic{font-size:1.15rem;}
+.nav-btn.active{color:#3878ff;}
+
+/* ── Misc ───────────────────────────── */
+.copybox{display:flex;gap:8px;}
+.copybox input{margin-bottom:0;font-size:.74rem;}
+.toast{
+  position:fixed;left:50%;bottom:92px;transform:translateX(-50%) translateY(20px);
+  background:#151d30;border:1px solid rgba(255,255,255,.12);color:#eef2ff;padding:11px 18px;
+  border-radius:99px;font-size:.8rem;font-weight:600;opacity:0;transition:.25s;z-index:20;pointer-events:none;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);white-space:nowrap;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.empty{text-align:center;padding:30px 10px;color:#4a5d7a;font-size:.82rem;}
+.pill-tag{display:inline-block;font-size:.6rem;font-weight:800;padding:2px 8px;border-radius:99px;letter-spacing:.03em;}
+.pill-tag.force{background:rgba(239,68,68,.15);color:#f87171;}
+.pill-tag.fake{background:rgba(245,185,66,.15);color:#f5c86a;}
+.row2{display:flex;gap:8px;}
+.row2>*{flex:1;}
+.admin-nav{display:flex;gap:6px;overflow-x:auto;margin-bottom:14px;padding-bottom:2px;}
+.admin-nav button{
+  flex-shrink:0;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:#8ea2c9;
+  padding:8px 13px;border-radius:99px;font-size:.72rem;font-weight:700;font-family:inherit;cursor:pointer;
+}
+.admin-nav button.active{background:#3878ff;border-color:#3878ff;color:#fff;}
+.list-item{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 0;
+  border-bottom:1px solid rgba(255,255,255,.05);
+}
+.list-item:last-child{border-bottom:none;}
+.mini{font-size:.68rem;color:#5a7090;}
+.loading{text-align:center;padding:40px;color:#4a5d7a;font-size:.85rem;}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>Reward Hub</div>
+    <div class="bal-chip" id="topBal">— Birr</div>
+  </div>
+  <div id="view"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="navbar" id="navbar">
+  <button class="nav-btn active" data-tab="home"><span class="ic">🏠</span>Home</button>
+  <button class="nav-btn" data-tab="tasks"><span class="ic">🧩</span>Tasks</button>
+  <button class="nav-btn" data-tab="invite"><span class="ic">🔗</span>Invite</button>
+  <button class="nav-btn" data-tab="withdraw"><span class="ic">💸</span>Withdraw</button>
+  <button class="nav-btn" id="adminNavBtn" data-tab="admin" style="display:none"><span class="ic">⚙️</span>Admin</button>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════
+   SETUP
+   ══════════════════════════════════════════════════════════════════ */
+const tg = window.Telegram?.WebApp || null;
+if (tg) { tg.ready(); tg.expand(); }
+const initData = tg?.initData || "";
+const _p = new URLSearchParams(location.search);
+const FORCE_ADMIN_TAB = _p.get("admin") === "1";
+
+let ME = null;
+
+function toast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+async function api(path, body = {}) {
+  const r = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ initData, ...body }),
+  });
+  if (!r.ok) {
+    let detail = "error";
+    try { detail = (await r.json()).detail || detail; } catch {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+function fmt(n){ return Number(n || 0).toFixed(2); }
+
+/* ══════════════════════════════════════════════════════════════════
+   NAV
+   ══════════════════════════════════════════════════════════════════ */
+const views = {};
+let currentTab = "home";
+
+document.getElementById("navbar").addEventListener("click", (e) => {
+  const btn = e.target.closest(".nav-btn");
+  if (!btn) return;
+  switchTab(btn.dataset.tab);
+});
+
+function switchTab(tab){
+  currentTab = tab;
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  render();
+  tg?.HapticFeedback?.impactOccurred("light");
+}
+
+async function render(){
+  const view = document.getElementById("view");
+  view.innerHTML = `<div class="loading">Loading…</div>`;
+  try {
+    if (currentTab === "home")     await renderHome(view);
+    if (currentTab === "tasks")    await renderTasks(view);
+    if (currentTab === "invite")   await renderInvite(view);
+    if (currentTab === "withdraw") await renderWithdraw(view);
+    if (currentTab === "admin")    await renderAdmin(view);
+  } catch (e) {
+    view.innerHTML = `<div class="empty">⚠️ Couldn't load this. ${e.message === "banned" ? "Your account is banned." : "Pull to retry."}</div>`;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   HOME
+   ══════════════════════════════════════════════════════════════════ */
+async function refreshMe(){
+  ME = await api("/api/me");
+  document.getElementById("topBal").textContent = `${fmt(ME.balance)} Birr`;
+  document.getElementById("adminNavBtn").style.display = ME.is_admin ? "flex" : "none";
+  return ME;
+}
+
+async function renderHome(view){
+  await refreshMe();
+  view.innerHTML = `
+    <div class="hero">
+      <div class="label">Available Balance</div>
+      <div class="amount">${fmt(ME.balance)} <span>Birr</span></div>
+      <div class="sub">Min. withdrawal: ${fmt(ME.min_withdrawal)} Birr</div>
+      <div class="stat-row">
+        <div class="stat-box"><div class="n">${ME.referrals}</div><div class="l">Referrals</div></div>
+        <div class="stat-box"><div class="n">${fmt(ME.reward_per_referral)}</div><div class="l">Per Invite</div></div>
+        <div class="stat-box"><div class="n">${fmt(ME.total_earned_refs)}</div><div class="l">Earned</div></div>
+      </div>
+    </div>
+    <div class="row2">
+      <button class="btn gold" onclick="switchTab('tasks')">🧩 Do Tasks</button>
+      <button class="btn ghost" onclick="switchTab('invite')">🔗 Invite Friends</button>
+    </div>
+    <h2 class="sect">Quick Actions</h2>
+    <div class="card" style="display:flex;flex-direction:column;gap:8px;">
+      <button class="btn ghost" onclick="switchTab('withdraw')">💸 Request Withdrawal</button>
+    </div>
+  `;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   TASKS
+   ══════════════════════════════════════════════════════════════════ */
+let taskTimer = null;
+
+async function renderTasks(view){
+  const data = await api("/api/tasks");
+  clearInterval(taskTimer);
+
+  if (!data.tasks.length){
+    view.innerHTML = `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    return;
+  }
+
+  view.innerHTML = `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList"></div>`;
+  const list = document.getElementById("taskList");
+
+  function paint(){
+    list.innerHTML = data.tasks.map(t => taskCardHTML(t)).join("");
+  }
+  paint();
+
+  taskTimer = setInterval(() => {
+    let dirty = false;
+    data.tasks.forEach(t => {
+      if (t.status === "waiting" && t.wait_left > 0){
+        t.wait_left -= 1;
+        if (t.wait_left <= 0) t.status = "claimable";
+        dirty = true;
+      }
+    });
+    if (dirty) paint();
+  }, 1000);
+
+  window._taskAction = async (id, action) => {
+    const t = data.tasks.find(x => x.id === id);
+    if (!t) return;
+    try {
+      if (action === "join"){
+        if (t.invite_link) window.open(t.invite_link, "_blank");
+        const r = await api("/api/tasks/join", { task_id: id });
+        t.status = "waiting";
+        t.wait_left = r.wait_seconds;
+        paint();
+      } else if (action === "claim"){
+        const r = await api("/api/tasks/claim", { task_id: id });
+        if (r.status === "completed"){
+          t.status = "completed";
+          toast(`🎉 +${fmt(r.reward)} Birr credited!`);
+          document.getElementById("topBal").textContent = `${fmt(r.balance)} Birr`;
+          tg?.HapticFeedback?.notificationOccurred("success");
+        }
+        paint();
+      }
+    } catch (e){
+      if (e.message.startsWith("wait:")){
+        toast(`⏳ Wait ${e.message.split(":")[1]}s more`);
+      } else if (e.message === "not_member"){
+        toast("❌ You haven't joined the channel yet.");
+      } else {
+        toast("⚠️ Something went wrong.");
+      }
+    }
+  };
+}
+
+function taskCardHTML(t){
+  const typeTag = t.task_type === "force"
+    ? `<span class="pill-tag force">CHECKED</span>`
+    : `<span class="pill-tag fake">QUICK</span>`;
+  let btn;
+  if (t.status === "completed"){
+    btn = `<button class="task-btn done" disabled>✓ Done</button>`;
+  } else if (t.status === "claimable"){
+    btn = `<button class="task-btn claim" onclick="_taskAction(${t.id},'claim')">Claim</button>`;
+  } else if (t.status === "waiting"){
+    btn = `<button class="task-btn wait" disabled>⏳ ${t.wait_left}s</button>`;
+  } else {
+    btn = `<button class="task-btn join" onclick="_taskAction(${t.id},'join')">Join</button>`;
+  }
+  return `
+    <div class="task ${t.status === 'completed' ? 'completed' : ''}">
+      <div class="task-ic">📢</div>
+      <div class="task-body">
+        <div class="task-title">${escapeHtml(t.title)} ${typeTag}</div>
+        <div class="task-reward">+${fmt(t.reward)} Birr</div>
+      </div>
+      ${btn}
+    </div>
+  `;
+}
+
+function escapeHtml(s){
+  return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   INVITE
+   ══════════════════════════════════════════════════════════════════ */
+async function renderInvite(view){
+  await refreshMe();
+  view.innerHTML = `
+    <h2 class="sect">Your Invite Link</h2>
+    <div class="card">
+      <div class="copybox">
+        <input readonly id="refLink" value="${ME.referral_link}">
+        <button class="btn sm" style="width:auto;padding:11px 16px;" onclick="copyLink()">Copy</button>
+      </div>
+      <button class="btn gold" style="margin-top:10px" onclick="shareLink()">📤 Share with Friends</button>
+    </div>
+    <h2 class="sect">Network</h2>
+    <div class="card stat-row" style="margin-bottom:0">
+      <div class="stat-box"><div class="n">${ME.referrals}</div><div class="l">Direct</div></div>
+      <div class="stat-box"><div class="n">${ME.tier2_referrals}</div><div class="l">Tier-2</div></div>
+      <div class="stat-box"><div class="n">${fmt(ME.total_earned_refs)}</div><div class="l">Earned</div></div>
+    </div>
+  `;
+}
+function copyLink(){
+  const el = document.getElementById("refLink");
+  el.select(); document.execCommand("copy");
+  navigator.clipboard?.writeText(el.value).catch(()=>{});
+  toast("🔗 Link copied!");
+}
+function shareLink(){
+  const url = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent("Join and earn rewards! 🎁")}`;
+  tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, "_blank");
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   WITHDRAW
+   ══════════════════════════════════════════════════════════════════ */
+async function renderWithdraw(view){
+  await refreshMe();
+  const hist = await api("/api/withdraw/history");
+  view.innerHTML = `
+    <h2 class="sect">Request Withdrawal</h2>
+    <div class="card">
+      <label class="f">Amount (Birr) — min ${fmt(ME.min_withdrawal)}</label>
+      <input type="number" id="wAmount" placeholder="e.g. 100">
+      <label class="f">Telebirr Phone Number</label>
+      <input type="text" id="wPhone" placeholder="09xxxxxxxx">
+      <label class="f">Full Name</label>
+      <input type="text" id="wName" placeholder="Account holder name">
+      <button class="btn gold" onclick="submitWithdraw()">💸 Submit Request</button>
+    </div>
+    <h2 class="sect">History</h2>
+    <div class="card" id="wHistory">
+      ${hist.withdrawals.length ? hist.withdrawals.map(w => `
+        <div class="list-item">
+          <div>
+            <div style="font-weight:700;font-size:.82rem">${fmt(w.amount)} Birr</div>
+            <div class="mini">${w.created_at}</div>
+          </div>
+          <span class="pill-tag ${w.status === 'approved' ? 'fake' : w.status === 'rejected' ? 'force' : ''}"
+                style="background:${w.status==='pending'?'rgba(56,120,255,.15)':''};color:${w.status==='pending'?'#7fa8ff':''}">
+            ${w.status.toUpperCase()}
+          </span>
+        </div>
+      `).join("") : `<div class="empty">No withdrawals yet.</div>`}
+    </div>
+  `;
+}
+async function submitWithdraw(){
+  const amount = parseFloat(document.getElementById("wAmount").value);
+  const phone  = document.getElementById("wPhone").value.trim();
+  const name   = document.getElementById("wName").value.trim();
+  if (!amount || amount < ME.min_withdrawal) return toast(`❌ Min ${fmt(ME.min_withdrawal)} Birr`);
+  if (phone.length < 9) return toast("❌ Enter a valid phone number");
+  if (name.length < 3) return toast("❌ Enter your full name");
+  try {
+    await api("/api/withdraw", { amount, phone, full_name: name });
+    toast("✅ Withdrawal submitted!");
+    tg?.HapticFeedback?.notificationOccurred("success");
+    renderWithdraw(document.getElementById("view"));
+  } catch (e){
+    toast("❌ " + (e.message || "Failed"));
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   ADMIN
+   ══════════════════════════════════════════════════════════════════ */
+let adminSubTab = "tasks";
+
+async function renderAdmin(view){
+  view.innerHTML = `
+    <h2 class="sect">Admin Control Center</h2>
+    <div class="admin-nav" id="adminNav">
+      <button data-t="tasks" class="active">Tasks</button>
+      <button data-t="channels">Gate Channels</button>
+      <button data-t="withdrawals">Withdrawals</button>
+      <button data-t="users">Users</button>
+      <button data-t="settings">Settings</button>
+      <button data-t="broadcast">Broadcast</button>
+    </div>
+    <div id="adminBody"></div>
+  `;
+  document.getElementById("adminNav").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    document.querySelectorAll("#adminNav button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    adminSubTab = b.dataset.t;
+    paintAdminBody();
+  });
+  await paintAdminBody();
+}
+
+async function paintAdminBody(){
+  const body = document.getElementById("adminBody");
+  body.innerHTML = `<div class="loading">Loading…</div>`;
+  if (adminSubTab === "tasks")       return adminTasks(body);
+  if (adminSubTab === "channels")    return adminChannels(body);
+  if (adminSubTab === "withdrawals") return adminWithdrawals(body);
+  if (adminSubTab === "users")       return adminUsers(body);
+  if (adminSubTab === "settings")    return adminSettings(body);
+  if (adminSubTab === "broadcast")   return adminBroadcast(body);
+}
+
+/* ── Admin: Tasks ─────────────────────────────────────────────── */
+async function adminTasks(body){
+  const { tasks } = await api("/api/admin/tasks/list");
+  body.innerHTML = `
+    <div class="card">
+      <label class="f">Task Title</label>
+      <input id="atTitle" placeholder="e.g. Join our News Channel">
+      <label class="f">Type</label>
+      <select id="atType">
+        <option value="fake">🟡 Fake Join — no real check, wait-timer only</option>
+        <option value="force">🔴 Force Join — bot must be admin, real check</option>
+      </select>
+      <label class="f">Channel ID (only needed for Force Join, e.g. -1001234567890)</label>
+      <input id="atChannelId" placeholder="-1001234567890">
+      <label class="f">Invite Link</label>
+      <input id="atLink" placeholder="https://t.me/yourchannel">
+      <label class="f">Reward (Birr)</label>
+      <input id="atReward" type="number" placeholder="5">
+      <button class="btn gold" onclick="createTask()">+ Add Task</button>
+    </div>
+    <h2 class="sect">Existing Tasks (${tasks.length})</h2>
+    <div class="card" id="taskAdminList">
+      ${tasks.length ? tasks.map((t,i) => adminTaskRow(t, i, tasks.length)).join("") : `<div class="empty">No tasks yet.</div>`}
+    </div>
+  `;
+  window._tasksCache = tasks;
+}
+function adminTaskRow(t, i, total){
+  const typeTag = t.task_type === "force" ? `<span class="pill-tag force">FORCE</span>` : `<span class="pill-tag fake">FAKE</span>`;
+  const activeTag = t.is_active ? "" : `<span class="mini" style="color:#f87171"> (inactive)</span>`;
+  return `
+    <div class="list-item">
+      <div style="min-width:0">
+        <div style="font-weight:700;font-size:.82rem">${escapeHtml(t.title)} ${typeTag}${activeTag}</div>
+        <div class="mini">Reward: ${fmt(t.reward)} Birr</div>
+      </div>
+      <div style="display:flex;gap:5px;flex-shrink:0">
+        <button class="btn sm ghost" style="width:auto" onclick="moveTask(${t.id},-1)" ${i===0?"disabled":""}>↑</button>
+        <button class="btn sm ghost" style="width:auto" onclick="moveTask(${t.id},1)" ${i===total-1?"disabled":""}>↓</button>
+        <button class="btn sm ghost" style="width:auto" onclick="toggleTask(${t.id},${t.is_active?0:1})">${t.is_active?"⏸":"▶"}</button>
+        <button class="btn sm danger" style="width:auto" onclick="deleteTask(${t.id})">🗑</button>
+      </div>
+    </div>
+  `;
+}
+async function createTask(){
+  const title = document.getElementById("atTitle").value.trim();
+  const task_type = document.getElementById("atType").value;
+  const channel_id = document.getElementById("atChannelId").value.trim();
+  const invite_link = document.getElementById("atLink").value.trim();
+  const reward = parseFloat(document.getElementById("atReward").value || 0);
+  if (!title) return toast("❌ Enter a title");
+  try {
+    await api("/api/admin/tasks/create", { title, task_type, channel_id, invite_link, reward });
+    toast("✅ Task added");
+    paintAdminBody();
+  } catch (e){ toast("❌ " + e.message); }
+}
+async function deleteTask(id){
+  await api("/api/admin/tasks/delete", { id });
+  toast("🗑 Task deleted");
+  paintAdminBody();
+}
+async function toggleTask(id, newState){
+  await api("/api/admin/tasks/update", { id, is_active: newState });
+  paintAdminBody();
+}
+async function moveTask(id, dir){
+  const tasks = window._tasksCache || [];
+  const idx = tasks.findIndex(t => t.id === id);
+  const swapWith = idx + dir;
+  if (swapWith < 0 || swapWith >= tasks.length) return;
+  [tasks[idx], tasks[swapWith]] = [tasks[swapWith], tasks[idx]];
+  await api("/api/admin/tasks/reorder", { order: tasks.map(t => t.id) });
+  paintAdminBody();
+}
+
+/* ── Admin: Gate Channels (mandatory to use the bot) ─────────────── */
+async function adminChannels(body){
+  const { channels } = await api("/api/admin/channels/list");
+  body.innerHTML = `
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        🔴 <b>Force Join</b> = bot must be admin there, real membership check.<br>
+        🟡 <b>Fake Join</b> = no real check, just shown as a required step.
+      </div>
+      <label class="f">Type</label>
+      <select id="acType">
+        <option value="0">🔴 Force Join (real check)</option>
+        <option value="1">🟡 Fake Join (no check)</option>
+      </select>
+      <label class="f">Channel ID (required for Force Join)</label>
+      <input id="acId" placeholder="-1001234567890">
+      <label class="f">Display Name</label>
+      <input id="acName" placeholder="My Channel">
+      <label class="f">Invite Link</label>
+      <input id="acLink" placeholder="https://t.me/yourchannel">
+      <button class="btn gold" onclick="createChannel()">+ Add Gate Channel</button>
+    </div>
+    <h2 class="sect">Gate Channels (${channels.length})</h2>
+    <div class="card">
+      ${channels.length ? channels.map(c => `
+        <div class="list-item">
+          <div>
+            <div style="font-weight:700;font-size:.82rem">${escapeHtml(c.channel_name)}
+              <span class="pill-tag ${c.bot_added ? 'fake' : 'force'}">${c.bot_added ? 'FAKE' : 'FORCE'}</span>
+            </div>
+            <div class="mini">${escapeHtml(c.invite_link)}</div>
+          </div>
+          <button class="btn sm danger" style="width:auto" onclick="deleteChannel(${c.id})">🗑</button>
+        </div>
+      `).join("") : `<div class="empty">No gate channels yet.</div>`}
+    </div>
+  `;
+}
+async function createChannel(){
+  const bot_added = parseInt(document.getElementById("acType").value);
+  const channel_id = document.getElementById("acId").value.trim();
+  const channel_name = document.getElementById("acName").value.trim();
+  const invite_link = document.getElementById("acLink").value.trim();
+  if (!channel_name || !invite_link) return toast("❌ Fill name & link");
+  try {
+    await api("/api/admin/channels/create", { bot_added, channel_id, channel_name, invite_link });
+    toast("✅ Channel added");
+    paintAdminBody();
+  } catch (e){ toast("❌ " + e.message); }
+}
+async function deleteChannel(id){
+  await api("/api/admin/channels/delete", { id });
+  toast("🗑 Removed");
+  paintAdminBody();
+}
+
+/* ── Admin: Withdrawals ───────────────────────────────────────── */
+async function adminWithdrawals(body){
+  const { withdrawals } = await api("/api/admin/withdrawals/list");
+  body.innerHTML = `
+    <h2 class="sect" style="margin-top:0">Pending (${withdrawals.length})</h2>
+    <div class="card">
+      ${withdrawals.length ? withdrawals.map(w => `
+        <div class="list-item">
+          <div>
+            <div style="font-weight:700;font-size:.82rem">${fmt(w.amount)} Birr — ${escapeHtml(w.full_name)}</div>
+            <div class="mini">UID ${w.user_id} · ${escapeHtml(w.phone)}</div>
+          </div>
+          <div style="display:flex;gap:5px;flex-shrink:0">
+            <button class="btn sm ghost" style="width:auto;background:rgba(34,197,94,.15);color:#4ade80" onclick="approveWd(${w.id})">✓</button>
+            <button class="btn sm danger" style="width:auto" onclick="rejectWd(${w.id})">✕</button>
+          </div>
+        </div>
+      `).join("") : `<div class="empty">No pending withdrawals.</div>`}
+    </div>
+  `;
+}
+async function approveWd(id){
+  await api("/api/admin/withdrawals/approve", { id });
+  toast("✅ Approved");
+  paintAdminBody();
+}
+async function rejectWd(id){
+  const reason = prompt("Rejection reason:") || "No reason given.";
+  await api("/api/admin/withdrawals/reject", { id, reason });
+  toast("❌ Rejected & refunded");
+  paintAdminBody();
+}
+
+/* ── Admin: Users ─────────────────────────────────────────────── */
+async function adminUsers(body){
+  body.innerHTML = `
+    <div class="card">
+      <label class="f">Telegram User ID</label>
+      <input id="auId" type="number" placeholder="123456789">
+      <button class="btn ghost" onclick="searchUser()">🔍 Search</button>
+      <div id="userResult" style="margin-top:12px"></div>
+    </div>
+  `;
+}
+async function searchUser(){
+  const uid = parseInt(document.getElementById("auId").value);
+  if (!uid) return toast("❌ Enter a user ID");
+  const box = document.getElementById("userResult");
+  try {
+    const u = await api("/api/admin/users/search", { user_id: uid });
+    box.innerHTML = `
+      <div class="list-item">
+        <div>
+          <div style="font-weight:700">${escapeHtml(u.full_name)} ${u.username ? '@'+escapeHtml(u.username) : ''}</div>
+          <div class="mini">Balance: ${fmt(u.balance)} · Refs: ${u.referrals} · ${u.is_banned ? '🚫 Banned' : '✅ Active'}</div>
+        </div>
+      </div>
+      <div class="row2" style="margin-top:10px">
+        <button class="btn sm ${u.is_banned ? '' : 'danger'}" onclick="toggleBan(${uid}, ${u.is_banned ? 0 : 1})">${u.is_banned ? '✅ Unban' : '🚫 Ban'}</button>
+        <button class="btn sm ghost" onclick="adjustBalance(${uid})">✍️ Adjust Balance</button>
+      </div>
+    `;
+  } catch (e){ box.innerHTML = `<div class="empty">User not found.</div>`; }
+}
+async function toggleBan(uid, banned){
+  await api("/api/admin/users/ban", { user_id: uid, banned });
+  toast(banned ? "🚫 Banned" : "✅ Unbanned");
+  searchUser();
+}
+async function adjustBalance(uid){
+  const amt = parseFloat(prompt("Amount to add (negative to subtract):") || "0");
+  if (!amt) return;
+  await api("/api/admin/users/balance", { user_id: uid, amount: amt });
+  toast("✅ Balance updated");
+  searchUser();
+}
+
+/* ── Admin: Settings ──────────────────────────────────────────── */
+async function adminSettings(body){
+  const s = await api("/api/admin/settings");
+  body.innerHTML = `
+    <div class="card">
+      <label class="f">Reward per Referral (Birr)</label>
+      <input id="stReward" type="number" value="${s.reward_per_referral}">
+      <label class="f">Minimum Withdrawal (Birr)</label>
+      <input id="stMinWd" type="number" value="${s.min_withdrawal}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
+  `;
+}
+async function saveSettings(){
+  const reward_per_referral = parseFloat(document.getElementById("stReward").value);
+  const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
+  await api("/api/admin/settings/update", { reward_per_referral, min_withdrawal });
+  toast("✅ Settings saved");
+}
+
+/* ── Admin: Broadcast ─────────────────────────────────────────── */
+async function adminBroadcast(body){
+  body.innerHTML = `
+    <div class="card">
+      <label class="f">Message to all users</label>
+      <textarea id="bcText" rows="5" placeholder="Type your announcement…"></textarea>
+      <button class="btn gold" onclick="sendBroadcast()">📢 Send Broadcast</button>
+    </div>
+  `;
+}
+async function sendBroadcast(){
+  const text = document.getElementById("bcText").value.trim();
+  if (!text) return toast("❌ Enter a message");
+  if (!confirm("Send this to ALL users?")) return;
+  toast("📤 Sending…");
+  const r = await api("/api/admin/broadcast", { text });
+  toast(`✅ Sent to ${r.sent} users (${r.failed} failed)`);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   BOOT
+   ══════════════════════════════════════════════════════════════════ */
+(async () => {
+  try {
+    await refreshMe();
+    if (FORCE_ADMIN_TAB && ME.is_admin) switchTab("admin");
+    else render();
+  } catch (e) {
+    document.getElementById("view").innerHTML =
+      `<div class="empty">⚠️ ${e.message === "banned" ? "Your account has been banned." : "Couldn't load your data. Please reopen from the bot."}</div>`;
+  }
+})();
+</script>
+</body>
+</html>
