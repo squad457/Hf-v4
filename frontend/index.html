@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Security Check</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="config.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{
+  height:100%;background:#090d18;
+  font-family:'Inter',system-ui,sans-serif;
+  color:#dde4f0;
+  display:flex;align-items:center;justify-content:center;
+  -webkit-font-smoothing:antialiased;
+}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;
+  background:radial-gradient(ellipse 70% 50% at 50% -10%,rgba(56,120,255,.12) 0%,transparent 70%);
+}
+.card{
+  position:relative;z-index:1;
+  width:calc(100% - 32px);max-width:350px;
+  background:#0f1622;
+  border:1px solid rgba(255,255,255,.07);
+  border-radius:22px;
+  padding:32px 20px 26px;
+  text-align:center;
+  box-shadow:0 20px 60px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.05);
+}
+.icon-zone{
+  width:72px;height:72px;margin:0 auto 20px;
+  position:relative;display:flex;align-items:center;justify-content:center;
+}
+.icon-bg{
+  position:absolute;inset:0;border-radius:50%;
+  background:rgba(56,120,255,.1);
+  border:1.5px solid rgba(56,120,255,.22);
+  transition:background .4s,border-color .4s;
+}
+.icon-zone.state-ok .icon-bg{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);}
+.icon-zone.state-err .icon-bg{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);}
+.icon-zone svg{width:28px;height:28px;position:relative;z-index:1;transition:opacity .2s;}
+@keyframes rot{to{transform:rotate(360deg)}}
+.spin-ring{
+  position:absolute;inset:-7px;border-radius:50%;
+  border:2px solid transparent;
+  border-top-color:#3878ff;
+  border-right-color:rgba(56,120,255,.2);
+  animation:rot .9s linear infinite;
+}
+.icon-zone.state-ok .spin-ring,
+.icon-zone.state-err .spin-ring{display:none;}
+.title{font-size:1.1rem;font-weight:800;letter-spacing:-.025em;color:#eef2ff;margin-bottom:4px;}
+.sub{font-size:.76rem;color:#4a5d7a;line-height:1.5;margin-bottom:22px;min-height:2.2em;}
+.bar-track{height:3px;background:rgba(255,255,255,.06);border-radius:99px;margin-bottom:18px;overflow:hidden;}
+.bar-fill{
+  height:100%;width:0%;border-radius:99px;
+  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+  transition:width .5s cubic-bezier(.4,0,.2,1);
+}
+.bar-fill.s-ok{background:linear-gradient(90deg,#15803d,#22c55e);width:100%!important;}
+.bar-fill.s-err{background:linear-gradient(90deg,#991b1b,#ef4444);width:100%!important;}
+.steps{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
+.step{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 12px;
+  background:rgba(255,255,255,.02);
+  border:1px solid rgba(255,255,255,.06);
+  border-radius:12px;text-align:left;
+  transition:border-color .3s,background .3s;
+}
+.step.active{border-color:rgba(56,120,255,.35);background:rgba(56,120,255,.05);}
+.step.s-ok  {border-color:rgba(34,197,94,.25);background:rgba(34,197,94,.04);}
+.step.s-err {border-color:rgba(239,68,68,.3); background:rgba(239,68,68,.04);}
+.dot{
+  width:22px;height:22px;flex-shrink:0;border-radius:50%;
+  background:rgba(255,255,255,.07);
+  display:flex;align-items:center;justify-content:center;
+  font-size:.6rem;font-weight:700;color:#556070;
+  transition:background .3s,color .3s;
+}
+.step.active .dot{background:#3878ff;color:#fff;}
+.step.s-ok   .dot{background:#22c55e;color:#fff;}
+.step.s-err  .dot{background:#ef4444;color:#fff;}
+.step-body{flex:1;min-width:0;}
+.step-name{font-size:.76rem;font-weight:600;color:#c0cfe8;}
+.step-info{font-size:.67rem;color:#374458;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.step.active .step-info{color:#5a7090;}
+.step.s-ok   .step-info{color:#166534;}
+.step.s-err  .step-info{color:#7f1d1d;}
+@keyframes sp{to{transform:rotate(360deg)}}
+.sp{
+  width:12px;height:12px;flex-shrink:0;border-radius:50%;
+  border:2px solid rgba(56,120,255,.15);
+  border-top-color:#3878ff;
+  animation:sp .7s linear infinite;
+  display:none;
+}
+.step.active .sp{display:block;}
+.pill{
+  display:none;padding:12px 14px;border-radius:11px;
+  font-size:.78rem;font-weight:500;line-height:1.6;text-align:left;
+}
+.pill strong{font-weight:700;}
+.pill.s-ok {display:block;background:rgba(34,197,94,.07);color:#4ade80;border:1px solid rgba(34,197,94,.18);}
+.pill.s-err{display:block;background:rgba(239,68,68,.07);color:#f87171;border:1px solid rgba(239,68,68,.18);}
+@keyframes pulse-ok{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.2)}50%{box-shadow:0 0 0 9px rgba(34,197,94,0)}}
+.icon-zone.state-ok .icon-bg{animation:pulse-ok 2s ease infinite;}
+.retry-btn{
+  display:none;width:100%;margin-top:14px;padding:12px;
+  border:none;border-radius:11px;cursor:pointer;
+  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+  color:#fff;font-size:.85rem;font-weight:700;
+  font-family:inherit;
+}
+.retry-btn.show{display:block;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon-zone" id="iconZone">
+    <div class="spin-ring"></div>
+    <div class="icon-bg"></div>
+    <svg id="iShield" viewBox="0 0 24 24" fill="none" stroke="#3878ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      <polyline points="9 12 11 14 15 10"/>
+    </svg>
+    <svg id="iCheck" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+      <circle cx="12" cy="12" r="10"/><polyline points="7 12 10.5 15.5 17 9"/>
+    </svg>
+    <svg id="iX" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+      <circle cx="12" cy="12" r="10"/>
+      <line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+    </svg>
+  </div>
+  <div class="title" id="ttl">Security Check</div>
+  <div class="sub"   id="sub">Verifying your identity…</div>
+  <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
+  <div class="steps">
+    <div class="step active" id="s1">
+      <div class="dot" id="d1">1</div>
+      <div class="step-body">
+        <div class="step-name">Session Validation</div>
+        <div class="step-info" id="i1">Reading Telegram session…</div>
+      </div>
+      <div class="sp"></div>
+    </div>
+    <div class="step" id="s2">
+      <div class="dot" id="d2">2</div>
+      <div class="step-body">
+        <div class="step-name">Hardware Cryptography</div>
+        <div class="step-info" id="i2">Waiting…</div>
+      </div>
+      <div class="sp"></div>
+    </div>
+    <div class="step" id="s3">
+      <div class="dot" id="d3">3</div>
+      <div class="step-body">
+        <div class="step-name">Identity Authentication</div>
+        <div class="step-info" id="i3">Waiting…</div>
+      </div>
+      <div class="sp"></div>
+    </div>
+  </div>
+  <div class="pill" id="pill"></div>
+  <button class="retry-btn" id="retryBtn" onclick="location.reload()">🔄 እንደገና ይሞክሩ / Retry</button>
+</div>
+
+<script>
+/* ── Config ───────────────────────────────────── */
+const BACKEND = BACKEND_URL; // from config.js
+const _p      = new URLSearchParams(location.search);
+const UID     = parseInt(_p.get("uid")    || "0", 10);
+const REF_ID  = parseInt(_p.get("ref")    || "0", 10);
+const MSG_ID  = parseInt(_p.get("msg_id") || "0", 10);
+
+const tg       = window.Telegram?.WebApp || null;
+if(tg){ tg.ready(); tg.expand(); }
+const initData = tg?.initData || "";
+
+const TG_PLATFORM = (tg?.platform || "").toLowerCase().trim();
+const TG_VERSION  = (tg?.version  || "").trim();
+const TG_APP_VERSION = [TG_PLATFORM, TG_VERSION].filter(Boolean).join("_") || "unknown";
+
+/* ── DOM ──────────────────────────────────────── */
+const $bar      = document.getElementById("bar");
+const $pill     = document.getElementById("pill");
+const $iconZone = document.getElementById("iconZone");
+const $retryBtn = document.getElementById("retryBtn");
+
+/* ── Helpers ──────────────────────────────────── */
+function setBar(p){ $bar.style.width = p + "%"; }
+function activate(n){
+  const el = document.getElementById(`s${n}`);
+  el.classList.remove("s-ok","s-err");
+  el.classList.add("active");
+  document.getElementById(`i${n}`).textContent = "Processing…";
+}
+function ok(n, info){
+  const s = document.getElementById(`s${n}`);
+  s.classList.remove("active"); s.classList.add("s-ok");
+  document.getElementById(`d${n}`).textContent = "✓";
+  document.getElementById(`i${n}`).textContent = info;
+}
+function err(n, info){
+  const s = document.getElementById(`s${n}`);
+  s.classList.remove("active"); s.classList.add("s-err");
+  document.getElementById(`d${n}`).textContent = "✕";
+  document.getElementById(`i${n}`).textContent = info;
+}
+function showOK(){
+  $iconZone.classList.add("state-ok");
+  document.getElementById("iShield").style.display = "none";
+  document.getElementById("iCheck").style.display  = "";
+  document.getElementById("ttl").textContent = "Verified!";
+  document.getElementById("sub").textContent = "Welcome! Opening your dashboard…";
+  $bar.classList.add("s-ok");
+  $pill.className   = "pill s-ok";
+  $pill.textContent = "✅ Verification complete. Opening app…";
+  tg?.HapticFeedback?.notificationOccurred("success");
+}
+function showErr(reason, allowRetry){
+  $iconZone.classList.remove("state-ok");
+  $iconZone.classList.add("state-err");
+  document.getElementById("iShield").style.display = "none";
+  document.getElementById("iCheck").style.display  = "none";
+  document.getElementById("iX").style.display      = "";
+  $bar.classList.remove("s-ok");
+  $bar.classList.add("s-err");
+  $pill.className = "pill s-err";
+
+  /*
+   * NOTE: messaging softened on purpose.
+   * Hard, irreversible "BANNED — retrying is pointless" language was
+   * discouraging legitimate users from trying again after fixing a real
+   * issue (VPN still on, weak signal, temporary duplicate-device flag).
+   * Server-side fraud rules now only hard-ban on strong combined signals
+   * (fingerprint + IP both matching, etc). Anything softer surfaces a
+   * normal "couldn't verify, try again / contact admin" message instead.
+   */
+  const SELF_REASONS  = new Set(["self_invite", "same_device_as_referrer"]);
+  const MULTI_REASONS = new Set([
+    "correlated_clone", "ip_farm", "banned_ip"
+  ]);
+
+  let category;
+  if (reason === "vpn") {
+    category = "vpn";
+  } else if (reason === "ip_cooldown") {
+    category = "cooldown";
+  } else if (reason === "no_fingerprint") {
+    category = "device_retry";
+  } else if (SELF_REASONS.has(reason)) {
+    category = "self";
+  } else if (MULTI_REASONS.has(reason)) {
+    category = "multi";
+  } else {
+    category = "device_retry";
+  }
+
+  const msgs = {
+    vpn: {
+      t:"VPN Detected", s:"Please disable VPN and try again.",
+      b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው እንደገና ይሞክሩ።"
+    },
+    cooldown: {
+      t:"Please Wait", s:"Too many attempts from this network.",
+      b:"⚠️ <strong>እባክዎ ለማጭበርበር አይሞክሩ!</strong><br>payout request ላይ የእርስዎ መረጃ ስለሚታይ የመከልከል ምክንያት ሊሆኑብዎት ይችላል ስለዚህ ትክክለኛ ሰዉ በመጋበዝ ገንዘብ ይስሩ ይጠንቀቁ ።"
+    },
+    device_retry: {
+      t:"Couldn't Verify", s:"We couldn't check your device — please retry.",
+      b:"⚠️ <strong>ማረጋገጥ አልተቻለም።</strong><br>እባክዎ app ዝግተው/ከፍተው እንደገና ይሞክሩ። ችግሩ ከቀጠለ admin ያነጋግሩ።"
+    },
+    self: {
+      t:"Verification Failed", s:"Self-invite is not allowed.",
+      b:"⚠️ <strong>ራስን መጋበዝ አይፈቀድም።</strong><br>ይሄ ሊንክ ስራ ላይ የሚውለው ሌላ ሰው ሲጠቀምበት ብቻ ነው። ስህተት ይመስልዎታል ካለ admin ያነጋግሩ።"
+    },
+    multi: {
+      t:"Verification Failed", s:"This device/account looks like a duplicate.",
+      b:"⚠️ <strong>ይሄ መሣሪያ/አካውንት ቀደም ሲል ጥቅም ላይ ውሏል።</strong><br>ስህተት ይመስልዎታል ብለው ካመኑ admin ያነጋግሩ — በማረጋገጥ ይታያል።"
+    },
+  };
+  const m = msgs[category];
+  document.getElementById("ttl").textContent = m.t;
+  document.getElementById("sub").textContent = m.s;
+  $pill.innerHTML = m.b;
+  tg?.HapticFeedback?.notificationOccurred("error");
+
+  if (allowRetry) {
+    $retryBtn.classList.add("show");
+  }
+}
+function closeApp(ms){ setTimeout(() => tg?.close(), ms); }
+function goToApp(ms){
+  setTimeout(() => {
+    location.href = `app.html?uid=${UID}`;
+  }, ms);
+}
+
+/* ── Post helper ──────────────────────────────── */
+async function fetchPost(url, body, ms=12000){
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, {
+      method:  "POST",
+      headers: {"Content-Type": "application/json"},
+      body:    JSON.stringify(body),
+      signal:  ctrl.signal,
+    });
+    clearTimeout(timer);
+    return r;
+  } catch(e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
+
+/* ── SHA-256 helper ───────────────────────────── */
+async function sha256(text){
+  try {
+    const enc = new TextEncoder().encode(text);
+    const buf = await crypto.subtle.digest("SHA-256", enc);
+    return Array.from(new Uint8Array(buf))
+      .map(b => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return "sha_err_" + Date.now();
+  }
+}
+
+/* ── STEP 1 — Session validation ─────────────────── */
+async function validateSession(){
+  activate(1);
+  setBar(10);
+  await new Promise(r => setTimeout(r, 300));
+
+  const user = tg?.initDataUnsafe?.user;
+  if (!initData || !user?.id) {
+    throw new Error("no_tg_session");
+  }
+  ok(1, "Telegram Session OK");
+  setBar(30);
+}
+
+/* ── STEP 2 — Hardware fingerprints ──────────────── */
+async function getFingerprint(){
+  activate(2);
+  setBar(40);
+
+  let canvasRaw = "";
+  try {
+    const c   = document.createElement("canvas");
+    c.width   = 240; c.height = 60;
+    const ctx = c.getContext("2d");
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle    = "#f0f";
+    ctx.fillRect(0, 0, 240, 60);
+    ctx.fillStyle = "rgba(102,204,0,.7)";
+    ctx.font      = "15px 'Arial'";
+    ctx.fillText("Squad4xx🔐verify", 4, 20);
+    canvasRaw = c.toDataURL();
+  } catch {}
+  const canvasHash = canvasRaw ? await sha256(canvasRaw) : "canvas_err";
+
+  let webglRaw = "";
+  try {
+    const cv = document.createElement("canvas");
+    const gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
+    if (gl) {
+      const ext      = gl.getExtension("WEBGL_debug_renderer_info");
+      const vendor   = gl.getParameter(ext?.UNMASKED_VENDOR_WEBGL   || 37445) || "";
+      const renderer = gl.getParameter(ext?.UNMASKED_RENDERER_WEBGL || 37446) || "";
+      webglRaw = vendor + "|||" + renderer;
+    }
+  } catch {}
+  const webglHash = webglRaw ? await sha256(webglRaw) : "webgl_err";
+
+  const screenSig = `${screen.width}x${screen.height}x${screen.colorDepth}@${Math.round(devicePixelRatio || 1) * 100}`;
+
+  const tz   = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
+  const lang = navigator.language || "en";
+
+  let tgSig = "";
+  if (tg) {
+    const u = tg.initDataUnsafe?.user || {};
+    tgSig = [
+      TG_PLATFORM,
+      TG_VERSION,
+      tg.colorScheme    || "",
+      u.language_code   || "",
+      u.is_premium ? "1" : "0",
+    ].join("|");
+  }
+
+  const combined = [
+    canvasRaw.slice(-80),
+    webglRaw,
+    screenSig,
+    `dpr:${devicePixelRatio || 1}`,
+    `tz:${tz}`,
+    `cpu:${navigator.hardwareConcurrency || 0}`,
+    `plat:${navigator.platform || ""}`,
+    `lang:${lang}`,
+    `ua:${navigator.userAgent}`,
+    tgSig,
+  ].join("|||");
+  const fingerprint = await sha256(combined);
+
+  ok(2, "Hardware Signature Verified");
+  setBar(65);
+  return { fingerprint, canvasHash, webglHash, screenSig };
+}
+
+/* ── STEP 3 — Submit ──────────────────────────── */
+async function submit(fpData){
+  activate(3);
+  document.getElementById("i3").textContent = "Authenticating…";
+  setBar(80);
+
+  const r = await fetchPost(`${BACKEND}/api/verify`, {
+    uid:          UID,
+    refId:        REF_ID,
+    msgId:        MSG_ID,
+    initData:     initData,
+    ua:           navigator.userAgent,
+    fingerprint:  fpData.fingerprint,
+    canvasHash:   fpData.canvasHash,
+    webglHash:    fpData.webglHash,
+    screenSig:    fpData.screenSig,
+    tgPlatform:   TG_PLATFORM,
+    tgVersion:    TG_VERSION,
+    tgAppVersion: TG_APP_VERSION,
+  });
+
+  if (r.status === 429) {
+    const j = await r.json().catch(() => ({}));
+    throw Object.assign(new Error("rate_limited"), { isRate: true, detail: j.detail });
+  }
+  if (!r.ok) throw new Error(`Server ${r.status}`);
+  return await r.json();
+}
+
+/* ── Main ─────────────────────────────────────── */
+(async () => {
+  try {
+    await validateSession();
+    const fpData = await getFingerprint();
+    const result = await submit(fpData);
+    setBar(100);
+
+    if (result.status === "verified" || result.status === "already_verified") {
+      ok(3, "Passed ✓");
+      showOK();
+      goToApp(1200);
+    } else if (result.status === "blocked") {
+      err(3, "Rejected ✕");
+      /*
+       * Soft blocks: user can fix something (VPN, wait out cooldown,
+       * retry fingerprinting) and try again right away.
+       * Hard blocks: server already evaluated strong combined fraud
+       * signals — still don't slam the door instantly, give the user
+       * the message + a manual retry button instead of a scary
+       * "don't bother" wall, but auto-close a bit sooner.
+       */
+      const softBlock = ["vpn", "no_fingerprint", "ip_cooldown"].includes(result.reason);
+      showErr(result.reason || "unknown", true);
+      if (!softBlock) {
+        closeApp(8000);
+      }
+      // Soft blocks: never auto-close — let the user read, fix, and retry.
+    } else {
+      throw new Error("Unexpected: " + JSON.stringify(result));
+    }
+  } catch(e) {
+    err(3, "Failed ✕");
+    showErr("unknown", true);
+    console.error("[verify]", e);
+    // Don't auto-close on unexpected client errors — let user retry manually.
+  }
+})();
+</script>
+</body>
+</html>
