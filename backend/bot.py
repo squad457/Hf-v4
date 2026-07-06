@@ -40,7 +40,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 load_dotenv()
@@ -71,6 +71,13 @@ PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
 DB_PATH              = "referral_bot.db"
 TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
+
+# How old a Telegram WebApp initData payload is allowed to be before we
+# reject it. initData is only re-issued when the Mini App is (re)opened
+# inside Telegram, so this bounds how long a copied/leaked initData string
+# (e.g. pasted into a normal browser) stays usable. Telegram itself
+# recommends checking auth_date for exactly this reason.
+MAX_INIT_DATA_AGE_SECONDS = int(os.getenv("MAX_INIT_DATA_AGE_SECONDS", str(6 * 3600)))
 
 TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
 
@@ -1294,6 +1301,19 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
         sig    = hmac.new(key, check_str.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, vh):
             return None
+
+        # Reject stale payloads. initData carries a unix `auth_date` set by
+        # Telegram at the moment the Mini App was opened — if it's older
+        # than our allowed window, treat it as invalid rather than trusting
+        # a copy-pasted link opened outside Telegram / hours later.
+        try:
+            auth_date = int(parsed.get("auth_date", "0"))
+        except ValueError:
+            return None
+        age = time.time() - auth_date
+        if age < 0 or age > MAX_INIT_DATA_AGE_SECONDS:
+            return None
+
         return json.loads(parsed.get("user", "{}"))
     except Exception:
         return None
@@ -2243,6 +2263,20 @@ api_app.add_middleware(
 )
 
 
+@api_app.middleware("http")
+async def _no_store_cache_headers(request, call_next):
+    """Every /api/* response carries per-user data (balance, referrals,
+    withdrawal history, ...). Without explicit no-store headers, some
+    mobile browsers/webviews will happily serve a cached copy of a
+    previous response — which on a shared device could mean showing one
+    Telegram account's balance to whoever opens the Mini App next. This
+    guarantees every response is always freshly fetched."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 class ApiBase(BaseModel):
     initData: str = ""
 
@@ -2583,7 +2617,7 @@ async def api_tasks_claim(body: TaskActionRequest):
 
 # ── /api/withdraw ─────────────────────────────────────────────────────────
 class WithdrawRequest(ApiBase):
-    amount: float
+    amount: float = Field(gt=0)
     phone: str
     full_name: str
 
