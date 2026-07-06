@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate"/>
+<meta http-equiv="Pragma" content="no-cache"/>
 <title>Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -110,10 +112,28 @@ body::before{
   position:fixed;inset:0;z-index:80;background:var(--bg);display:flex;flex-direction:column;
   padding:26px 18px calc(20px + env(safe-area-inset-bottom));
 }
-#gate::before{
+#gate::before,#notTg::before{
   content:'';position:fixed;inset:0;pointer-events:none;
   background:radial-gradient(ellipse 60% 40% at 15% -8%,rgba(46,156,109,.2) 0%,transparent 65%),
              radial-gradient(ellipse 55% 40% at 105% 100%,rgba(231,181,77,.13) 0%,transparent 65%);
+}
+/* ── Blocking screen shown when opened outside Telegram ── */
+#notTg{
+  position:fixed;inset:0;z-index:90;background:var(--bg);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;text-align:center;gap:16px;
+  padding:26px 22px calc(20px + env(safe-area-inset-bottom));
+}
+.notg-badge{
+  width:64px;height:64px;border-radius:18px;position:relative;z-index:1;
+  background:linear-gradient(135deg,#2AABEE,#229ED9);display:flex;align-items:center;
+  justify-content:center;font-size:1.7rem;box-shadow:0 14px 34px rgba(42,171,238,.35);
+}
+.notg-h1{position:relative;z-index:1;font-family:'Sora',sans-serif;font-size:1.15rem;font-weight:800;}
+.notg-p{position:relative;z-index:1;font-size:.85rem;color:var(--ink-dim);line-height:1.5;max-width:300px;}
+.notg-btn{
+  position:relative;z-index:1;display:inline-flex;align-items:center;gap:8px;
+  background:linear-gradient(135deg,#2AABEE,#229ED9);color:#fff;font-weight:700;font-size:.9rem;
+  padding:13px 22px;border-radius:14px;text-decoration:none;box-shadow:0 14px 34px rgba(42,171,238,.3);
 }
 .gate-head{position:relative;z-index:1;text-align:center;margin:10px 0 22px;}
 .gate-badge{
@@ -305,6 +325,13 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   <div id="gateFooter">
     <button class="btn gold" id="gateRecheckBtn" onclick="recheckGate()">✅ I've Joined</button>
   </div>
+</div>
+
+<div id="notTg" style="display:none">
+  <div class="notg-badge">✈️</div>
+  <h1 class="notg-h1">Open in Telegram</h1>
+  <p class="notg-p">This app only works inside Telegram. It looks like it was opened in a regular browser — tap below to go back to the bot.</p>
+  <a class="notg-btn" id="openInTgBtn" href="#" target="_blank">📲 Open in Telegram</a>
 </div>
 
 <div class="wrap">
@@ -927,7 +954,7 @@ async function adminWithdrawals(body){
 }
 async function approveWd(id){
   await api("/api/admin/withdrawals/approve", { id });
-  toast("✅ Approved");
+  toast("✅ Completed ");
   paintAdminBody();
 }
 async function rejectWd(id){
@@ -1075,6 +1102,20 @@ async function recheckGate(){
     const elapsed = Date.now() - started;
     const wait = Math.max(0, MIN_SPLASH_MS - elapsed);
     setTimeout(() => splash.classList.add("hide"), wait);
+  }
+
+  // ── Telegram-only gate ──────────────────────────────────────────
+  // If this page wasn't opened from inside Telegram (no Telegram.WebApp,
+  // or it has no initData — e.g. someone copied the link into a normal
+  // browser), stop here. No /api/* call is made at all in this case, so
+  // no balance or personal data is ever fetched into a non-Telegram
+  // browser.
+  if (!tg || !tg.initData) {
+    splash.classList.add("hide");
+    const link = document.getElementById("openInTgBtn");
+    if (link) link.href = `https://t.me/${BOT_USERNAME}`;
+    document.getElementById("notTg").style.display = "flex";
+    return;
   }
 
   try {
