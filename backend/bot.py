@@ -2435,6 +2435,42 @@ async def api_tasks_join(body: TaskActionBody):
     await DataEngine.mark_task_joined(uid, body.task_id)
     return {"wait_seconds": TASK_JOIN_WAIT_SECONDS}
 
+@api_platform.post("/api/tasks/check")
+async def api_tasks_check(body: TaskActionBody):
+    """
+    Lightweight verification step — confirms the wait timer is done and
+    (for 'force' tasks) that the user has actually joined the channel via
+    a real getChatMember lookup. Does NOT pay out the reward; that only
+    happens in /api/tasks/claim. This lets the Mini App show a genuine
+    Join → Check → Claim flow instead of paying blindly after a timer.
+    """
+    uid = await _authed_uid(body)
+    await _ensure_user_ok(uid)
+    task = await DataEngine.get_task(body.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="not_found")
+    progress = await DataEngine.get_task_progress(uid, body.task_id)
+    if not progress or progress["status"] == "completed":
+        raise HTTPException(status_code=400, detail="not_joined")
+    try:
+        joined_at = datetime.fromisoformat(progress["joined_at"])
+        elapsed = (datetime.utcnow() - joined_at).total_seconds()
+    except Exception:
+        elapsed = TASK_JOIN_WAIT_SECONDS
+    remaining = int(TASK_JOIN_WAIT_SECONDS - elapsed)
+    if remaining > 0:
+        raise HTTPException(status_code=400, detail=f"wait:{remaining}")
+    if task["task_type"] == "force" and task["channel_id"]:
+        try:
+            m = await bot.get_chat_member(chat_id=task["channel_id"], user_id=uid)
+            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                raise HTTPException(status_code=400, detail="not_member")
+        except HTTPException:
+            raise
+        except Exception:
+            logger.warning(f"[TASK] Could not verify membership for task={task['id']} user={uid} — allowing through.")
+    return {"status": "verified"}
+
 @api_platform.post("/api/tasks/claim")
 async def api_tasks_claim(body: TaskActionBody):
     uid = await _authed_uid(body)
