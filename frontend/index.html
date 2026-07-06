@@ -221,7 +221,7 @@ function showOK(){
   $pill.textContent = "✅ Verification complete. Opening app…";
   tg?.HapticFeedback?.notificationOccurred("success");
 }
-function showErr(reason, allowRetry){
+function showErr(reason, allowRetry, detail){
   $iconZone.classList.remove("state-ok");
   $iconZone.classList.add("state-err");
   document.getElementById("iShield").style.display = "none";
@@ -246,7 +246,9 @@ function showErr(reason, allowRetry){
   ]);
 
   let category;
-  if (reason === "vpn") {
+  if (reason === "network" || reason === "server_error") {
+    category = reason;                    // already an exact client-side category
+  } else if (reason === "vpn") {
     category = "vpn";
   } else if (reason === "ip_cooldown") {
     category = "cooldown";
@@ -281,11 +283,19 @@ function showErr(reason, allowRetry){
       t:"Verification Failed", s:"This device/account looks like a duplicate.",
       b:"⚠️ <strong>ይሄ መሣሪያ/አካውንት ቀደም ሲል ጥቅም ላይ ውሏል።</strong><br>ስህተት ይመስልዎታል ብለው ካመኑ admin ያነጋግሩ — በማረጋገጥ ይታያል።"
     },
+    network: {
+      t:"Connection Error", s:"Couldn't reach the server.",
+      b:"🌐 <strong>ከሰርቨሩ (backend) ጋር መገናኘት አልተቻለም።</strong><br>ይሄ የ multi-check ውጤት አይደለም — የ URL/CORS/deploy ችግር ነው። Admin: <code>config.js</code> ውስጥ ያለውን BACKEND_URL እና Railway ላይ ያለውን ALLOWED_ORIGIN/FRONTEND_URL ያረጋግጡ።"
+    },
+    server_error: {
+      t:"Server Error", s:"The backend returned an error.",
+      b:"🛑 <strong>Backend ላይ ስህተት ተፈጥሯል።</strong><br>ይሄ የ multi-check ውጤት አይደለም። Admin: Railway logs ውስጥ ይመልከቱ።"
+    },
   };
-  const m = msgs[category];
+  const m = msgs[category] || msgs.device_retry;
   document.getElementById("ttl").textContent = m.t;
   document.getElementById("sub").textContent = m.s;
-  $pill.innerHTML = m.b;
+  $pill.innerHTML = m.b + (detail ? `<br><span style="opacity:.55;font-size:.72em">debug: ${detail}</span>` : "");
   tg?.HapticFeedback?.notificationOccurred("error");
 
   if (allowRetry) {
@@ -475,8 +485,20 @@ async function submit(fpData){
     }
   } catch(e) {
     err(3, "Failed ✕");
-    showErr("unknown", true);
     console.error("[verify]", e);
+
+    let category = "unknown";
+    if (e.name === "AbortError") {
+      category = "network";               // request timed out
+    } else if (e instanceof TypeError) {
+      category = "network";               // fetch() itself failed — wrong
+                                           // BACKEND_URL, CORS blocked, or
+                                           // Railway backend is down/asleep
+    } else if (typeof e.message === "string" && e.message.startsWith("Server ")) {
+      category = "server_error";          // backend responded but with an
+                                           // HTTP error status (404/500/…)
+    }
+    showErr(category, true, e.message || String(e));
     // Don't auto-close on unexpected client errors — let user retry manually.
   }
 })();
