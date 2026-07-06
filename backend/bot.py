@@ -2183,17 +2183,10 @@ async def application_lifespan(app: FastAPI):
 api_platform = FastAPI(lifespan=application_lifespan)
 dp.include_router(core_router)
 
-_cors_origins = [ALLOWED_ORIGIN] if ALLOWED_ORIGIN else ["*"]
-api_platform.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=bool(ALLOWED_ORIGIN),
-    allow_methods=["POST", "GET"],
-    allow_headers=["Content-Type"],
-)
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(api_platform, host="0.0.0.0", port=port)
-
-# ───────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CORS
+#
+# ALLOWED_ORIGIN accepts one or more comma-separated origins (handy while
+# testing on both a Vercel preview URL and the production domain). Trailing
+# slashes are stripped because the browser's `Origin` header NEVER has one
+# ("https://x.vercel.app"
