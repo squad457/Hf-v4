@@ -2218,6 +2218,25 @@ api_platform.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ROOT / HEALTH CHECK
+#
+# Railway (and anyone opening the deployment URL directly in a browser) sends
+# a plain GET request to "/". Without a route registered for that path,
+# FastAPI correctly returns 404 {"detail":"Not Found"} — this is NOT a crash,
+# it just looks alarming in a browser. This route makes GET "/" and GET
+# "/health" return a normal 200 OK so the deployment looks "alive", and it
+# also gives Railway's health checker something to succeed against.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_platform.get("/")
+async def root_health_check():
+    return {"status": "ok", "service": "referral-bot", "message": "Backend is running."}
+
+@api_platform.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MINI APP REST API
 #
 # Everything below is what the two frontend pages (index.html = verify
@@ -2225,6 +2244,7 @@ api_platform.add_middleware(
 # existed before — the FastAPI app had middleware + lifespan but zero
 # routes, so every Mini App request was a silent 404.
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class BaseAuthBody(BaseModel):
     initData: str = ""
