@@ -4,30 +4,41 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <title>Security Check</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="config.js"></script>
 <style>
+:root{
+  --bg:#0a1310; --surface:#12211c;
+  --border:rgba(231,181,77,.16); --border-soft:rgba(255,255,255,.06);
+  --gold:#e7b54d; --emerald:#2e9c6d; --terracotta:#d1544a;
+  --ink:#f3eee2; --ink-dim:#a9b6ab; --ink-faint:#5f7268;
+}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{
-  height:100%;background:#090d18;
+  height:100%;background:var(--bg);
   font-family:'Inter',system-ui,sans-serif;
-  color:#dde4f0;
+  color:var(--ink);
   display:flex;align-items:center;justify-content:center;
   -webkit-font-smoothing:antialiased;
 }
 body::before{
   content:'';position:fixed;inset:0;pointer-events:none;
-  background:radial-gradient(ellipse 70% 50% at 50% -10%,rgba(56,120,255,.12) 0%,transparent 70%);
+  background:
+    radial-gradient(ellipse 60% 40% at 15% -8%,rgba(46,156,109,.18) 0%,transparent 65%),
+    radial-gradient(ellipse 55% 40% at 105% 100%,rgba(231,181,77,.12) 0%,transparent 65%);
 }
 .card{
   position:relative;z-index:1;
   width:calc(100% - 32px);max-width:350px;
-  background:#0f1622;
-  border:1px solid rgba(255,255,255,.07);
+  background:var(--surface);
+  border:1px solid var(--border-soft);
   border-radius:22px;
   padding:32px 20px 26px;
   text-align:center;
-  box-shadow:0 20px 60px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.05);
+  box-shadow:0 22px 60px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.04);
 }
 .icon-zone{
   width:72px;height:72px;margin:0 auto 20px;
@@ -35,33 +46,33 @@ body::before{
 }
 .icon-bg{
   position:absolute;inset:0;border-radius:50%;
-  background:rgba(56,120,255,.1);
-  border:1.5px solid rgba(56,120,255,.22);
+  background:rgba(231,181,77,.1);
+  border:1.5px solid rgba(231,181,77,.25);
   transition:background .4s,border-color .4s;
 }
-.icon-zone.state-ok .icon-bg{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);}
-.icon-zone.state-err .icon-bg{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);}
+.icon-zone.state-ok .icon-bg{background:rgba(46,156,109,.12);border-color:rgba(46,156,109,.35);}
+.icon-zone.state-err .icon-bg{background:rgba(209,84,74,.12);border-color:rgba(209,84,74,.35);}
 .icon-zone svg{width:28px;height:28px;position:relative;z-index:1;transition:opacity .2s;}
 @keyframes rot{to{transform:rotate(360deg)}}
 .spin-ring{
   position:absolute;inset:-7px;border-radius:50%;
   border:2px solid transparent;
-  border-top-color:#3878ff;
-  border-right-color:rgba(56,120,255,.2);
+  border-top-color:var(--gold);
+  border-right-color:rgba(231,181,77,.2);
   animation:rot .9s linear infinite;
 }
 .icon-zone.state-ok .spin-ring,
 .icon-zone.state-err .spin-ring{display:none;}
-.title{font-size:1.1rem;font-weight:800;letter-spacing:-.025em;color:#eef2ff;margin-bottom:4px;}
-.sub{font-size:.76rem;color:#4a5d7a;line-height:1.5;margin-bottom:22px;min-height:2.2em;}
+.title{font-family:'Sora',sans-serif;font-size:1.12rem;font-weight:700;letter-spacing:-.015em;color:var(--ink);margin-bottom:5px;}
+.sub{font-size:.76rem;color:var(--ink-faint);line-height:1.5;margin-bottom:22px;min-height:2.2em;}
 .bar-track{height:3px;background:rgba(255,255,255,.06);border-radius:99px;margin-bottom:18px;overflow:hidden;}
 .bar-fill{
   height:100%;width:0%;border-radius:99px;
-  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+  background:linear-gradient(90deg,#b9852a,#e7b54d);
   transition:width .5s cubic-bezier(.4,0,.2,1);
 }
-.bar-fill.s-ok{background:linear-gradient(90deg,#15803d,#22c55e);width:100%!important;}
-.bar-fill.s-err{background:linear-gradient(90deg,#991b1b,#ef4444);width:100%!important;}
+.bar-fill.s-ok{background:linear-gradient(90deg,#1f7a56,#2e9c6d);width:100%!important;}
+.bar-fill.s-err{background:linear-gradient(90deg,#8f2f28,#d1544a);width:100%!important;}
 .steps{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
 .step{
   display:flex;align-items:center;gap:10px;
@@ -71,30 +82,30 @@ body::before{
   border-radius:12px;text-align:left;
   transition:border-color .3s,background .3s;
 }
-.step.active{border-color:rgba(56,120,255,.35);background:rgba(56,120,255,.05);}
-.step.s-ok  {border-color:rgba(34,197,94,.25);background:rgba(34,197,94,.04);}
-.step.s-err {border-color:rgba(239,68,68,.3); background:rgba(239,68,68,.04);}
+.step.active{border-color:rgba(231,181,77,.35);background:rgba(231,181,77,.05);}
+.step.s-ok  {border-color:rgba(46,156,109,.3); background:rgba(46,156,109,.05);}
+.step.s-err {border-color:rgba(209,84,74,.3); background:rgba(209,84,74,.05);}
 .dot{
   width:22px;height:22px;flex-shrink:0;border-radius:50%;
   background:rgba(255,255,255,.07);
   display:flex;align-items:center;justify-content:center;
-  font-size:.6rem;font-weight:700;color:#556070;
+  font-family:'Sora',sans-serif;font-size:.6rem;font-weight:700;color:var(--ink-faint);
   transition:background .3s,color .3s;
 }
-.step.active .dot{background:#3878ff;color:#fff;}
-.step.s-ok   .dot{background:#22c55e;color:#fff;}
-.step.s-err  .dot{background:#ef4444;color:#fff;}
+.step.active .dot{background:var(--gold);color:#241a05;}
+.step.s-ok   .dot{background:var(--emerald);color:#fff;}
+.step.s-err  .dot{background:var(--terracotta);color:#fff;}
 .step-body{flex:1;min-width:0;}
-.step-name{font-size:.76rem;font-weight:600;color:#c0cfe8;}
-.step-info{font-size:.67rem;color:#374458;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.step.active .step-info{color:#5a7090;}
-.step.s-ok   .step-info{color:#166534;}
-.step.s-err  .step-info{color:#7f1d1d;}
+.step-name{font-family:'Sora',sans-serif;font-size:.76rem;font-weight:600;color:var(--ink-dim);}
+.step-info{font-size:.67rem;color:var(--ink-faint);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.step.active .step-info{color:#c9a15c;}
+.step.s-ok   .step-info{color:#6fcf9e;}
+.step.s-err  .step-info{color:#e8837a;}
 @keyframes sp{to{transform:rotate(360deg)}}
 .sp{
   width:12px;height:12px;flex-shrink:0;border-radius:50%;
-  border:2px solid rgba(56,120,255,.15);
-  border-top-color:#3878ff;
+  border:2px solid rgba(231,181,77,.15);
+  border-top-color:var(--gold);
   animation:sp .7s linear infinite;
   display:none;
 }
@@ -104,16 +115,16 @@ body::before{
   font-size:.78rem;font-weight:500;line-height:1.6;text-align:left;
 }
 .pill strong{font-weight:700;}
-.pill.s-ok {display:block;background:rgba(34,197,94,.07);color:#4ade80;border:1px solid rgba(34,197,94,.18);}
-.pill.s-err{display:block;background:rgba(239,68,68,.07);color:#f87171;border:1px solid rgba(239,68,68,.18);}
-@keyframes pulse-ok{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.2)}50%{box-shadow:0 0 0 9px rgba(34,197,94,0)}}
+.pill.s-ok {display:block;background:rgba(46,156,109,.08);color:#6fcf9e;border:1px solid rgba(46,156,109,.2);}
+.pill.s-err{display:block;background:rgba(209,84,74,.08);color:#e8837a;border:1px solid rgba(209,84,74,.2);}
+@keyframes pulse-ok{0%,100%{box-shadow:0 0 0 0 rgba(46,156,109,.25)}50%{box-shadow:0 0 0 9px rgba(46,156,109,0)}}
 .icon-zone.state-ok .icon-bg{animation:pulse-ok 2s ease infinite;}
 .retry-btn{
   display:none;width:100%;margin-top:14px;padding:12px;
   border:none;border-radius:11px;cursor:pointer;
-  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+  background:linear-gradient(135deg,#1f7a56,#2e9c6d);
   color:#fff;font-size:.85rem;font-weight:700;
-  font-family:inherit;
+  font-family:'Sora',sans-serif;
 }
 .retry-btn.show{display:block;}
 </style>
@@ -123,14 +134,14 @@ body::before{
   <div class="icon-zone" id="iconZone">
     <div class="spin-ring"></div>
     <div class="icon-bg"></div>
-    <svg id="iShield" viewBox="0 0 24 24" fill="none" stroke="#3878ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <svg id="iShield" viewBox="0 0 24 24" fill="none" stroke="#e7b54d" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
       <polyline points="9 12 11 14 15 10"/>
     </svg>
-    <svg id="iCheck" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+    <svg id="iCheck" viewBox="0 0 24 24" fill="none" stroke="#2e9c6d" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
       <circle cx="12" cy="12" r="10"/><polyline points="7 12 10.5 15.5 17 9"/>
     </svg>
-    <svg id="iX" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+    <svg id="iX" viewBox="0 0 24 24" fill="none" stroke="#d1544a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
       <circle cx="12" cy="12" r="10"/>
       <line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
     </svg>
