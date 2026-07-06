@@ -2445,16 +2445,19 @@ async def api_verify(body: VerifyRequest, request: Request):
 @api_app.post("/api/me")
 async def api_me(body: ApiBase):
     user = await _authenticate(body)
-    direct, _ = await DataEngine.get_referral_metrics(user["user_id"])
+    direct, tier2 = await DataEngine.get_referral_metrics(user["user_id"])
     rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    uname = BOT_USERNAME or (await bot.get_me()).username
     return {
         "user_id": user["user_id"],
         "balance": float(user["balance"]),
         "referrals": direct,
+        "tier2_referrals": tier2,
         "reward_per_referral": rate,
         "min_withdrawal": min_w,
         "total_earned_refs": round(direct * rate, 2),
+        "referral_link": f"https://t.me/{uname}?start={user['user_id']}",
         "is_admin": evaluate_admin_access(user["user_id"]),
     }
 
@@ -2603,7 +2606,7 @@ async def api_withdraw(body: WithdrawRequest):
 async def api_withdraw_history(body: ApiBase):
     user = await _authenticate(body)
     rows = await DataEngine.get_user_withdrawals(user["user_id"])
-    return {"history": [dict(r) for r in rows]}
+    return {"withdrawals": [dict(r) for r in rows]}
 
 
 # ── /api/admin/stats/overview — total & online users ─────────────────────
