@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate"/>
+<meta http-equiv="Pragma" content="no-cache"/>
 <title>Security Check</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -127,6 +129,14 @@ body::before{
   font-family:'Sora',sans-serif;
 }
 .retry-btn.show{display:block;}
+.tg-btn{
+  display:none;width:100%;margin-top:10px;padding:12px;
+  border:none;border-radius:11px;cursor:pointer;text-decoration:none;
+  background:linear-gradient(135deg,#2AABEE,#229ED9);
+  color:#fff;font-size:.85rem;font-weight:700;font-family:'Sora',sans-serif;
+  text-align:center;box-sizing:border-box;
+}
+.tg-btn.show{display:block;}
 </style>
 </head>
 <body>
@@ -177,6 +187,7 @@ body::before{
   </div>
   <div class="pill" id="pill"></div>
   <button class="retry-btn" id="retryBtn" onclick="location.reload()">🔄 እንደገና ይሞክሩ / Retry</button>
+  <a class="tg-btn" id="openInTgBtn" href="#" target="_blank">📲 Open in Telegram</a>
 </div>
 
 <script>
@@ -257,7 +268,9 @@ function showErr(reason, allowRetry, detail){
   ]);
 
   let category;
-  if (reason === "network" || reason === "server_error") {
+  if (reason === "no_tg_session") {
+    category = "not_telegram";
+  } else if (reason === "network" || reason === "server_error") {
     category = reason;                    // already an exact client-side category
   } else if (reason === "vpn") {
     category = "vpn";
@@ -274,6 +287,10 @@ function showErr(reason, allowRetry, detail){
   }
 
   const msgs = {
+    not_telegram: {
+      t:"Open in Telegram", s:"This only works inside Telegram.",
+      b:"✈️ <strong>ይሄ ገጽ የሚሰራው በ Telegram ውስጥ ብቻ ነው።</strong><br>ይመስላል ከ Telegram ውጭ (ለምሳሌ መደበኛ browser) ከፍተውታል። ከታች ያለውን ቁልፍ በመጫን ወደ ቦቱ ይመለሱ።"
+    },
     vpn: {
       t:"VPN Detected", s:"Please disable VPN and try again.",
       b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው እንደገና ይሞክሩ።"
@@ -309,7 +326,13 @@ function showErr(reason, allowRetry, detail){
   $pill.innerHTML = m.b + (detail ? `<br><span style="opacity:.55;font-size:.72em">debug: ${detail}</span>` : "");
   tg?.HapticFeedback?.notificationOccurred("error");
 
-  if (allowRetry) {
+  if (category === "not_telegram") {
+    // Retrying in the same non-Telegram browser can't work — send them
+    // back to the bot instead of offering a pointless retry.
+    const openBtn = document.getElementById("openInTgBtn");
+    openBtn.href = `https://t.me/${BOT_USERNAME}`;
+    openBtn.classList.add("show");
+  } else if (allowRetry) {
     $retryBtn.classList.add("show");
   }
 }
@@ -499,7 +522,11 @@ async function submit(fpData){
     console.error("[verify]", e);
 
     let category = "unknown";
-    if (e.name === "AbortError") {
+    if (e.message === "no_tg_session") {
+      category = "no_tg_session";         // opened outside Telegram — send
+                                           // the user back to the bot, not
+                                           // a generic retry prompt
+    } else if (e.name === "AbortError") {
       category = "network";               // request timed out
     } else if (e instanceof TypeError) {
       category = "network";               // fetch() itself failed — wrong
