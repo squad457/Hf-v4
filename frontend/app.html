@@ -33,6 +33,78 @@ body::before{
 .wrap{position:relative;z-index:1;max-width:480px;margin:0 auto;padding:18px 14px 8px;}
 ::-webkit-scrollbar{display:none}
 
+/* ── Keyframes ──────────────────────── */
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulseRing{0%{transform:scale(.85);opacity:.9}70%{transform:scale(1.35);opacity:0}100%{opacity:0}}
+@keyframes fadeSlideUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes popIn{0%{transform:scale(.5);opacity:0}70%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}
+@keyframes tickDraw{from{stroke-dashoffset:32}to{stroke-dashoffset:0}}
+@keyframes barSlide{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}
+
+/* ── Splash / boot screen ───────────── */
+#splash{
+  position:fixed;inset:0;z-index:999;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;
+  transition:opacity .45s ease,visibility .45s ease;
+}
+#splash::before{
+  content:'';position:fixed;inset:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse 60% 40% at 15% -8%,rgba(46,156,109,.22) 0%,transparent 65%),
+    radial-gradient(ellipse 55% 40% at 105% 100%,rgba(231,181,77,.16) 0%,transparent 65%);
+}
+#splash.hide{opacity:0;visibility:hidden;pointer-events:none;}
+.splash-mark{position:relative;width:84px;height:84px;display:flex;align-items:center;justify-content:center;z-index:1;}
+.splash-mark .ping{position:absolute;inset:0;border-radius:50%;border:2px solid var(--gold);animation:pulseRing 1.8s cubic-bezier(.3,.6,.4,1) infinite;}
+.splash-mark .ping:nth-child(2){animation-delay:.6s;}
+.splash-mark .core{
+  position:relative;width:64px;height:64px;border-radius:50%;
+  background:linear-gradient(135deg,#1f7a56,#2e9c6d 45%,#e7b54d);
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Sora',sans-serif;font-weight:800;font-size:1.3rem;color:#0a1310;
+  box-shadow:0 0 40px rgba(231,181,77,.35);
+}
+.splash-ring{position:absolute;inset:-9px;border-radius:50%;border:2.5px solid transparent;border-top-color:var(--gold);border-right-color:var(--gold);animation:spin 1s linear infinite;}
+.splash-word{font-family:'Sora',sans-serif;font-weight:800;font-size:1.05rem;letter-spacing:.02em;color:var(--ink);z-index:1;}
+.splash-word span{color:var(--gold);}
+.splash-track{width:170px;height:4px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;position:relative;z-index:1;}
+.splash-track i{position:absolute;top:0;left:0;height:100%;width:40%;border-radius:99px;background:linear-gradient(90deg,var(--emerald),var(--gold));animation:barSlide 1.1s ease-in-out infinite;}
+.splash-sub{font-size:.68rem;color:var(--ink-faint);letter-spacing:.05em;z-index:1;}
+
+/* ── Skeleton loading ───────────────── */
+.skel{
+  background:linear-gradient(90deg,var(--surface) 25%,var(--surface2) 50%,var(--surface) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:14px;
+}
+.skel-hero{height:168px;margin-bottom:14px;border-radius:20px;}
+.skel-line{height:14px;border-radius:7px;margin-bottom:10px;}
+.skel-card{height:64px;margin-bottom:10px;border-radius:15px;}
+
+/* ── Cascade reveal (top-to-bottom) ──── */
+.cascade>*{opacity:0;animation:fadeSlideUp .5s cubic-bezier(.2,.7,.3,1) forwards;}
+.cascade>*:nth-child(1){animation-delay:.02s}
+.cascade>*:nth-child(2){animation-delay:.09s}
+.cascade>*:nth-child(3){animation-delay:.16s}
+.cascade>*:nth-child(4){animation-delay:.23s}
+.cascade>*:nth-child(5){animation-delay:.30s}
+.cascade>*:nth-child(6){animation-delay:.37s}
+.cascade>*:nth-child(n+7){animation-delay:.44s}
+
+/* ── Circular spin loader (buttons / inline) ── */
+.spin-ico{width:15px;height:15px;border-radius:50%;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;display:inline-block;animation:spin .7s linear infinite;vertical-align:-3px;}
+.task-btn.dark-spin .spin-ico{border-color:rgba(36,26,5,.35);border-top-color:#241a05;}
+.btn .spin-ico{margin-right:7px;}
+
+/* ── Success check burst ─────────────── */
+.check-burst{
+  width:56px;height:56px;margin:0 auto 10px;border-radius:50%;
+  background:rgba(46,156,109,.14);display:flex;align-items:center;justify-content:center;
+  animation:popIn .45s cubic-bezier(.2,.8,.3,1.2);
+}
+.check-burst svg{width:28px;height:28px;}
+.check-burst svg path{stroke-dasharray:32;stroke-dashoffset:32;animation:tickDraw .4s .15s ease forwards;}
+
 /* ── Header ─────────────────────────── */
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;}
 .brand{display:flex;align-items:center;gap:9px;font-family:'Sora',sans-serif;font-weight:700;font-size:1.05rem;letter-spacing:-.01em;color:var(--ink);}
@@ -120,8 +192,11 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 }
 .task-btn.join{background:linear-gradient(135deg,#1f7a56,#2e9c6d);color:#fff;}
 .task-btn.wait{background:rgba(255,255,255,.06);color:var(--ink-faint);}
+.task-btn.check{background:linear-gradient(135deg,#2f6fb0,#4a90d9);color:#fff;}
 .task-btn.claim{background:linear-gradient(135deg,#b9852a,#e7b54d);color:#241a05;}
 .task-btn.done{background:rgba(46,156,109,.12);color:#6fcf9e;}
+.task-btn.busy{opacity:.85;cursor:default;}
+.task.completed{transition:opacity .4s,transform .4s;}
 
 /* ── Bottom nav ─────────────────────── */
 .navbar{
@@ -170,9 +245,20 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 </head>
 <body>
 
+<div id="splash">
+  <div class="splash-mark">
+    <span class="ping"></span><span class="ping"></span>
+    <div class="core">HF</div>
+    <div class="splash-ring"></div>
+  </div>
+  <div class="splash-word">HF <span>EARN V4</span></div>
+  <div class="splash-track"><i></i></div>
+  <div class="splash-sub">Securing your session…</div>
+</div>
+
 <div class="wrap">
   <div class="topbar">
-    <div class="brand"><span class="dot"></span>Reward Hub</div>
+    <div class="brand"><span class="dot"></span>HF EARN V4</div>
     <div class="bal-chip" id="topBal">— Birr</div>
   </div>
   <div id="view"></div>
@@ -243,9 +329,24 @@ function switchTab(tab){
   tg?.HapticFeedback?.impactOccurred("light");
 }
 
+function skeletonFor(tab){
+  if (tab === "home") return `
+    <div class="skel skel-hero"></div>
+    <div class="row2" style="margin-bottom:12px">
+      <div class="skel" style="height:46px;border-radius:13px"></div>
+      <div class="skel" style="height:46px;border-radius:13px"></div>
+    </div>
+    <div class="skel skel-line" style="width:40%"></div>
+    <div class="skel skel-card"></div>`;
+  if (tab === "tasks") return `
+    <div class="skel skel-line" style="width:50%"></div>
+    <div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div>`;
+  return `<div class="skel skel-line" style="width:45%"></div><div class="skel skel-card"></div><div class="skel skel-card"></div>`;
+}
+
 async function render(){
   const view = document.getElementById("view");
-  view.innerHTML = `<div class="loading">Loading…</div>`;
+  view.innerHTML = skeletonFor(currentTab);
   try {
     if (currentTab === "home")     await renderHome(view);
     if (currentTab === "tasks")    await renderTasks(view);
@@ -270,6 +371,7 @@ async function refreshMe(){
 async function renderHome(view){
   await refreshMe();
   view.innerHTML = `
+    <div class="cascade">
     <div class="hero">
       <div class="chip"></div>
       <div class="label">Available Balance</div>
@@ -289,6 +391,7 @@ async function renderHome(view){
     <div class="card" style="display:flex;flex-direction:column;gap:8px;">
       <button class="btn ghost" onclick="switchTab('withdraw')">💸 Request Withdrawal</button>
     </div>
+    </div>
   `;
 }
 
@@ -306,9 +409,12 @@ async function renderTasks(view){
     return;
   }
 
-  view.innerHTML = `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList"></div>`;
+  view.innerHTML = `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
   const list = document.getElementById("taskList");
 
+  // Server only tells us "claimable" once the wait timer is done — we then
+  // split that single state into a real two-tap flow: Check (verifies
+  // membership) → Claim (pays the reward). uiStage tracks that locally.
   function paint(){
     list.innerHTML = data.tasks.map(t => taskCardHTML(t)).join("");
   }
@@ -319,7 +425,7 @@ async function renderTasks(view){
     data.tasks.forEach(t => {
       if (t.status === "waiting" && t.wait_left > 0){
         t.wait_left -= 1;
-        if (t.wait_left <= 0) t.status = "claimable";
+        if (t.wait_left <= 0){ t.status = "claimable"; t.uiStage = "check"; }
         dirty = true;
       }
     });
@@ -329,14 +435,44 @@ async function renderTasks(view){
   window._taskAction = async (id, action) => {
     const t = data.tasks.find(x => x.id === id);
     if (!t) return;
-    try {
-      if (action === "join"){
-        if (t.invite_link) window.open(t.invite_link, "_blank");
+
+    if (action === "join"){
+      if (t.invite_link) window.open(t.invite_link, "_blank");
+      try {
         const r = await api("/api/tasks/join", { task_id: id });
         t.status = "waiting";
         t.wait_left = r.wait_seconds;
         paint();
-      } else if (action === "claim"){
+      } catch (e){ toast("⚠️ Couldn't start this task."); }
+      return;
+    }
+
+    if (action === "check"){
+      t.uiStage = "checking";
+      paint();
+      tg?.HapticFeedback?.impactOccurred("light");
+      try {
+        await api("/api/tasks/check", { task_id: id });
+        t.uiStage = "claim";
+        paint();
+      } catch (e){
+        t.uiStage = "check";
+        if (e.message.startsWith("wait:")){
+          toast(`⏳ Wait ${e.message.split(":")[1]}s more`);
+        } else if (e.message === "not_member"){
+          toast("❌ You haven't joined the channel yet — join then tap Check again.");
+        } else {
+          toast("⚠️ Couldn't verify. Try again.");
+        }
+        paint();
+      }
+      return;
+    }
+
+    if (action === "claim"){
+      t.uiStage = "claiming";
+      paint();
+      try {
         const r = await api("/api/tasks/claim", { task_id: id });
         if (r.status === "completed"){
           t.status = "completed";
@@ -345,30 +481,32 @@ async function renderTasks(view){
           tg?.HapticFeedback?.notificationOccurred("success");
         }
         paint();
-      }
-    } catch (e){
-      if (e.message.startsWith("wait:")){
-        toast(`⏳ Wait ${e.message.split(":")[1]}s more`);
-      } else if (e.message === "not_member"){
-        toast("❌ You haven't joined the channel yet.");
-      } else {
-        toast("⚠️ Something went wrong.");
+      } catch (e){
+        t.uiStage = "claim";
+        toast("⚠️ Something went wrong. Try again.");
+        paint();
       }
     }
   };
 }
 
 function taskCardHTML(t){
-  const typeTag = t.task_type === "force"
-    ? `<span class="pill-tag force">CHECKED</span>`
-    : `<span class="pill-tag fake">QUICK</span>`;
   let btn;
   if (t.status === "completed"){
     btn = `<button class="task-btn done" disabled>✓ Done</button>`;
-  } else if (t.status === "claimable"){
-    btn = `<button class="task-btn claim" onclick="_taskAction(${t.id},'claim')">Claim</button>`;
   } else if (t.status === "waiting"){
     btn = `<button class="task-btn wait" disabled>⏳ ${t.wait_left}s</button>`;
+  } else if (t.status === "claimable"){
+    const stage = t.uiStage || "check";
+    if (stage === "checking"){
+      btn = `<button class="task-btn check busy" disabled><span class="spin-ico"></span> Checking</button>`;
+    } else if (stage === "claim"){
+      btn = `<button class="task-btn claim" onclick="_taskAction(${t.id},'claim')">Claim</button>`;
+    } else if (stage === "claiming"){
+      btn = `<button class="task-btn claim dark-spin busy" disabled><span class="spin-ico"></span> Claiming</button>`;
+    } else {
+      btn = `<button class="task-btn check" onclick="_taskAction(${t.id},'check')">Check</button>`;
+    }
   } else {
     btn = `<button class="task-btn join" onclick="_taskAction(${t.id},'join')">Join</button>`;
   }
@@ -376,7 +514,7 @@ function taskCardHTML(t){
     <div class="task ${t.status === 'completed' ? 'completed' : ''}">
       <div class="task-ic">📢</div>
       <div class="task-body">
-        <div class="task-title">${escapeHtml(t.title)} ${typeTag}</div>
+        <div class="task-title">${escapeHtml(t.title)}</div>
         <div class="task-reward">+${fmt(t.reward)} Birr</div>
       </div>
       ${btn}
@@ -428,7 +566,8 @@ async function renderWithdraw(view){
   await refreshMe();
   const hist = await api("/api/withdraw/history");
   view.innerHTML = `
-    <h2 class="sect">Request Withdrawal</h2>
+    <div class="cascade">
+    <h2 class="sect" style="margin-top:0">Request Withdrawal</h2>
     <div class="card">
       <label class="f">Amount (Birr) — min ${fmt(ME.min_withdrawal)}</label>
       <input type="number" id="wAmount" placeholder="e.g. 100">
@@ -436,7 +575,7 @@ async function renderWithdraw(view){
       <input type="text" id="wPhone" placeholder="09xxxxxxxx">
       <label class="f">Full Name</label>
       <input type="text" id="wName" placeholder="Account holder name">
-      <button class="btn gold" onclick="submitWithdraw()">💸 Submit Request</button>
+      <button class="btn gold" id="wSubmitBtn" onclick="submitWithdraw()">💸 Submit Request</button>
     </div>
     <h2 class="sect">History</h2>
     <div class="card" id="wHistory">
@@ -453,6 +592,7 @@ async function renderWithdraw(view){
         </div>
       `).join("") : `<div class="empty">No withdrawals yet.</div>`}
     </div>
+    </div>
   `;
 }
 async function submitWithdraw(){
@@ -462,13 +602,30 @@ async function submitWithdraw(){
   if (!amount || amount < ME.min_withdrawal) return toast(`❌ Min ${fmt(ME.min_withdrawal)} Birr`);
   if (phone.length < 9) return toast("❌ Enter a valid phone number");
   if (name.length < 3) return toast("❌ Enter your full name");
+
+  const btn = document.getElementById("wSubmitBtn");
+  const card = btn.closest(".card");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin-ico" style="border-color:rgba(36,26,5,.35);border-top-color:#241a05"></span> Submitting…`;
+  card.querySelectorAll("input").forEach(i => i.disabled = true);
+
   try {
     await api("/api/withdraw", { amount, phone, full_name: name });
-    toast("✅ Withdrawal submitted!");
     tg?.HapticFeedback?.notificationOccurred("success");
-    renderWithdraw(document.getElementById("view"));
+    card.innerHTML = `
+      <div style="text-align:center;padding:6px 0 4px;animation:fadeSlideUp .35s ease">
+        <div class="check-burst">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M4 12.5l5 5L20 6" stroke="#2e9c6d" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div style="font-weight:700;font-family:'Sora',sans-serif;margin-bottom:4px">Request Submitted</div>
+        <div class="mini">We'll process it within 2–24 hours.</div>
+      </div>`;
+    setTimeout(() => renderWithdraw(document.getElementById("view")), 1500);
   } catch (e){
     toast("❌ " + (e.message || "Failed"));
+    btn.disabled = false;
+    btn.innerHTML = "💸 Submit Request";
+    card.querySelectorAll("input").forEach(i => i.disabled = false);
   }
 }
 
@@ -502,7 +659,7 @@ async function renderAdmin(view){
 
 async function paintAdminBody(){
   const body = document.getElementById("adminBody");
-  body.innerHTML = `<div class="loading">Loading…</div>`;
+  body.innerHTML = `<div class="skel skel-card"></div><div class="skel skel-card"></div>`;
   if (adminSubTab === "tasks")       return adminTasks(body);
   if (adminSubTab === "channels")    return adminChannels(body);
   if (adminSubTab === "withdrawals") return adminWithdrawals(body);
@@ -764,13 +921,28 @@ async function sendBroadcast(){
    BOOT
    ══════════════════════════════════════════════════════════════════ */
 (async () => {
+  const MIN_SPLASH_MS = 1100; // keeps the intro from flashing on fast connections
+  const started = Date.now();
+  const splash = document.getElementById("splash");
+
+  function dismissSplash(){
+    const elapsed = Date.now() - started;
+    const wait = Math.max(0, MIN_SPLASH_MS - elapsed);
+    setTimeout(() => splash.classList.add("hide"), wait);
+  }
+
   try {
     await refreshMe();
-    if (FORCE_ADMIN_TAB && ME.is_admin) switchTab("admin");
-    else render();
+    if (FORCE_ADMIN_TAB && ME.is_admin){
+      currentTab = "admin";
+      document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === "admin"));
+    }
+    await render();
+    dismissSplash();
   } catch (e) {
     document.getElementById("view").innerHTML =
       `<div class="empty">⚠️ ${e.message === "banned" ? "Your account has been banned." : "Couldn't load your data. Please reopen from the bot."}</div>`;
+    dismissSplash();
   }
 })();
 </script>
