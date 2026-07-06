@@ -817,8 +817,15 @@ async function createTask(){
   const reward = parseFloat(document.getElementById("atReward").value || 0);
   if (!title) return toast("❌ Enter a title");
   try {
-    await api("/api/admin/tasks/create", { title, task_type, channel_id, invite_link, reward });
+    const r = await api("/api/admin/tasks/create", { title, task_type, channel_id, invite_link, reward });
     toast("✅ Task added");
+    if (confirm(`Broadcast "${title}" to all users now?\n\nEveryone will get a message with an "Open App" button so they can jump in and do it.`)) {
+      toast("📤 Broadcasting…");
+      try {
+        const b = await api("/api/admin/tasks/broadcast", { task_id: r.task_id });
+        toast(`✅ Announced to ${b.sent} users (${b.failed} failed)`);
+      } catch (e){ toast("❌ Broadcast failed: " + e.message); }
+    }
     paintAdminBody();
   } catch (e){ toast("❌ " + e.message); }
 }
