@@ -105,6 +105,34 @@ body::before{
 .check-burst svg{width:28px;height:28px;}
 .check-burst svg path{stroke-dasharray:32;stroke-dashoffset:32;animation:tickDraw .4s .15s ease forwards;}
 
+/* ── Force-channel gate (blocks dashboard until joined) ── */
+#gate{
+  position:fixed;inset:0;z-index:80;background:var(--bg);display:flex;flex-direction:column;
+  padding:26px 18px calc(20px + env(safe-area-inset-bottom));
+}
+#gate::before{
+  content:'';position:fixed;inset:0;pointer-events:none;
+  background:radial-gradient(ellipse 60% 40% at 15% -8%,rgba(46,156,109,.2) 0%,transparent 65%),
+             radial-gradient(ellipse 55% 40% at 105% 100%,rgba(231,181,77,.13) 0%,transparent 65%);
+}
+.gate-head{position:relative;z-index:1;text-align:center;margin:10px 0 22px;}
+.gate-badge{
+  width:60px;height:60px;margin:0 auto 14px;border-radius:18px;
+  background:linear-gradient(135deg,#1f7a56,#2e9c6d);display:flex;align-items:center;
+  justify-content:center;font-size:1.5rem;box-shadow:0 14px 34px rgba(46,156,109,.3);
+}
+.gate-head h1{font-family:'Sora',sans-serif;font-size:1.15rem;font-weight:800;margin-bottom:6px;}
+.gate-head p{font-size:.82rem;color:var(--ink-dim);line-height:1.4;padding:0 8px;}
+#gateList{position:relative;z-index:1;flex:1;overflow-y:auto;}
+.gate-ch{
+  display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--border-soft);
+  border-radius:16px;padding:14px;margin-bottom:10px;animation:fadeSlideUp .4s ease forwards;opacity:0;
+}
+.gate-ch .gc-ic{width:38px;height:38px;border-radius:11px;background:rgba(231,181,77,.14);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;}
+.gate-ch .gc-name{font-weight:700;font-size:.85rem;flex:1;min-width:0;}
+.gate-ch a.btn{width:auto;padding:9px 16px;font-size:.75rem;flex-shrink:0;}
+#gateFooter{position:relative;z-index:1;padding-top:14px;}
+
 /* ── Header ─────────────────────────── */
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;}
 .brand{display:flex;align-items:center;gap:9px;font-family:'Sora',sans-serif;font-weight:700;font-size:1.05rem;letter-spacing:-.01em;color:var(--ink);}
@@ -216,12 +244,24 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 .copybox{display:flex;gap:8px;}
 .copybox input{margin-bottom:0;font-size:.74rem;font-family:'JetBrains Mono',monospace;}
 .toast{
-  position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(20px);
-  background:var(--surface2);border:1px solid var(--border);color:var(--ink);padding:12px 18px;
-  border-radius:99px;font-size:.8rem;font-weight:600;opacity:0;transition:.25s;z-index:20;pointer-events:none;
-  box-shadow:0 12px 32px rgba(0,0,0,.5);white-space:nowrap;font-family:'Sora',sans-serif;
+  position:fixed;top:calc(14px + env(safe-area-inset-top));left:50%;
+  transform:translateX(-50%) translateY(-140%);
+  min-width:200px;max-width:calc(100% - 32px);
+  background:var(--surface2);border:1px solid var(--border);color:var(--ink);
+  padding:12px 16px 12px 12px;border-radius:16px;font-size:.82rem;font-weight:600;
+  display:flex;align-items:center;gap:10px;
+  opacity:0;transition:transform .4s cubic-bezier(.2,.8,.2,1),opacity .3s;z-index:60;
+  box-shadow:0 18px 44px rgba(0,0,0,.55);font-family:'Sora',sans-serif;
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast .t-ic{
+  width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;font-size:.82rem;font-weight:800;
+}
+.toast.success .t-ic{background:rgba(46,156,109,.18);color:#6fcf9e;}
+.toast.error .t-ic{background:rgba(209,84,74,.18);color:#f0847a;}
+.toast.info .t-ic{background:rgba(231,181,77,.18);color:var(--gold);}
+.toast .t-msg{line-height:1.3;}
 .empty{text-align:center;padding:34px 10px;color:var(--ink-faint);font-size:.82rem;}
 .pill-tag{display:inline-block;font-family:'Sora',sans-serif;font-size:.58rem;font-weight:700;padding:3px 9px;border-radius:99px;letter-spacing:.04em;}
 .pill-tag.force{background:rgba(209,84,74,.15);color:#e8837a;}
@@ -256,6 +296,18 @@ label.f{font-size:.71rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   <div class="splash-sub">Securing your session…</div>
 </div>
 
+<div id="gate" style="display:none">
+  <div class="gate-head">
+    <div class="gate-badge">📢</div>
+    <h1>Join to Continue</h1>
+    <p>Please join the channel(s) below, then tap "I've Joined" to unlock your dashboard.</p>
+  </div>
+  <div id="gateList"></div>
+  <div id="gateFooter">
+    <button class="btn gold" id="gateRecheckBtn" onclick="recheckGate()">✅ I've Joined</button>
+  </div>
+</div>
+
 <div class="wrap">
   <div class="topbar">
     <div class="brand"><span class="dot"></span>HF EARN V4</div>
@@ -286,12 +338,20 @@ const FORCE_ADMIN_TAB = _p.get("admin") === "1";
 
 let ME = null;
 
-function toast(msg){
+function toast(msg, type){
+  if (!type){
+    if (/^(✅|🎉)/.test(msg)) type = "success";
+    else if (/^(❌|🚫|⚠️)/.test(msg)) type = "error";
+    else type = "info";
+  }
+  const icons = { success: "✓", error: "✕", info: "i" };
   const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.classList.add("show");
   clearTimeout(t._h);
-  t._h = setTimeout(() => t.classList.remove("show"), 2200);
+  t.classList.remove("show");
+  t.className = "toast " + type;
+  t.innerHTML = `<span class="t-ic">${icons[type]}</span><span class="t-msg">${escapeHtml(msg)}</span>`;
+  requestAnimationFrame(() => requestAnimationFrame(() => t.classList.add("show")));
+  t._h = setTimeout(() => t.classList.remove("show"), 2600);
 }
 
 async function api(path, body = {}) {
@@ -401,15 +461,29 @@ async function renderHome(view){
 let taskTimer = null;
 
 async function renderTasks(view){
-  const data = await api("/api/tasks");
+  const [data] = await Promise.all([api("/api/tasks"), loadGateStatus().catch(() => null)]);
   clearInterval(taskTimer);
 
+  const showFakeSection = !ME?.is_admin && GATE.fake_channels?.length && !GATE.fake_seen;
+  const fakeSectionHTML = showFakeSection ? `
+    <h2 class="sect" style="margin-top:0">Recommended Channels</h2>
+    <div class="card" id="fakeChCard" style="display:flex;flex-direction:column;gap:8px;">
+      ${GATE.fake_channels.map(c => `
+        <div class="gate-ch" style="margin-bottom:0">
+          <div class="gc-ic">📢</div>
+          <div class="gc-name">${escapeHtml(c.channel_name)}</div>
+          <a class="btn gold" href="${c.invite_link}" target="_blank" onclick="viewFakeChannel()">View</a>
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+
   if (!data.tasks.length){
-    view.innerHTML = `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    view.innerHTML = fakeSectionHTML + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
     return;
   }
 
-  view.innerHTML = `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
+  view.innerHTML = fakeSectionHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
   const list = document.getElementById("taskList");
 
   // Server only tells us "claimable" once the wait timer is done — we then
@@ -491,6 +565,7 @@ async function renderTasks(view){
 }
 
 function taskCardHTML(t){
+  const typeTag = t.task_type === "force" ? "" : `<span class="pill-tag fake">QUICK</span>`;
   let btn;
   if (t.status === "completed"){
     btn = `<button class="task-btn done" disabled>✓ Done</button>`;
@@ -514,7 +589,7 @@ function taskCardHTML(t){
     <div class="task ${t.status === 'completed' ? 'completed' : ''}">
       <div class="task-ic">📢</div>
       <div class="task-body">
-        <div class="task-title">${escapeHtml(t.title)}</div>
+        <div class="task-title">${escapeHtml(t.title)} ${typeTag}</div>
         <div class="task-reward">+${fmt(t.reward)} Birr</div>
       </div>
       ${btn}
@@ -524,6 +599,13 @@ function taskCardHTML(t){
 
 function escapeHtml(s){
   return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function viewFakeChannel(){
+  GATE.fake_seen = true;
+  const card = document.getElementById("fakeChCard");
+  if (card) card.style.display = "none";
+  try { await api("/api/gate/fake_seen"); } catch (e) {}
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -918,6 +1000,49 @@ async function sendBroadcast(){
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   FORCE-CHANNEL GATE (blocks dashboard until real channels are joined)
+   ══════════════════════════════════════════════════════════════════ */
+let GATE = { force_unjoined: [], fake_channels: [], fake_seen: true };
+
+async function loadGateStatus(){
+  GATE = await api("/api/gate/status");
+  return GATE;
+}
+
+function paintGate(){
+  const list = document.getElementById("gateList");
+  list.innerHTML = GATE.force_unjoined.map((c, i) => `
+    <div class="gate-ch" style="animation-delay:${i * 0.07}s">
+      <div class="gc-ic">📢</div>
+      <div class="gc-name">${escapeHtml(c.channel_name)}</div>
+      <a class="btn gold" href="${c.invite_link}" target="_blank" onclick="tg?.HapticFeedback?.impactOccurred('light')">Join</a>
+    </div>
+  `).join("");
+}
+
+async function recheckGate(){
+  const btn = document.getElementById("gateRecheckBtn");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin-ico" style="border-color:rgba(36,26,5,.35);border-top-color:#241a05"></span> Checking…`;
+  try {
+    await loadGateStatus();
+    if (GATE.force_unjoined.length === 0){
+      tg?.HapticFeedback?.notificationOccurred("success");
+      toast("✅ Verified! Welcome in.");
+      document.getElementById("gate").style.display = "none";
+      await render();
+    } else {
+      paintGate();
+      toast("❌ Still missing " + GATE.force_unjoined.length + " channel(s). Join then try again.");
+    }
+  } catch (e){
+    toast("⚠️ Couldn't verify. Try again.");
+  }
+  btn.disabled = false;
+  btn.innerHTML = "✅ I've Joined";
+}
+
+/* ══════════════════════════════════════════════════════════════════
    BOOT
    ══════════════════════════════════════════════════════════════════ */
 (async () => {
@@ -933,6 +1058,17 @@ async function sendBroadcast(){
 
   try {
     await refreshMe();
+
+    if (!ME.is_admin){
+      await loadGateStatus();
+      if (GATE.force_unjoined.length > 0){
+        paintGate();
+        dismissSplash();
+        document.getElementById("gate").style.display = "flex";
+        return; // dashboard stays locked until recheckGate() succeeds
+      }
+    }
+
     if (FORCE_ADMIN_TAB && ME.is_admin){
       currentTab = "admin";
       document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === "admin"));
