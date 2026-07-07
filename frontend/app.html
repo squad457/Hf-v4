@@ -598,6 +598,7 @@ async function watchAd(){
     return toast("❌ Couldn't load ads — try again shortly");
   }
   const btn = document.getElementById("watchAdBtn");
+  api("/api/ads/click", { kind: "video" }).catch(() => {}); // analytics-only, never blocks
   if (!adController){
     adController = window.Adsgram.init({ blockId: ADS.block_id });
     // Without these listeners, AdsGram shows its own raw technical popup
@@ -965,6 +966,7 @@ async function renderAdmin(view){
       <button data-t="channels">Gate Channels</button>
       <button data-t="withdrawals">Withdrawals</button>
       <button data-t="users">Users</button>
+      <button data-t="ads">Ads</button>
       <button data-t="settings">Settings</button>
       <button data-t="broadcast">Broadcast</button>
     </div>
@@ -998,6 +1000,7 @@ async function paintAdminBody(){
   if (adminSubTab === "channels")    return adminChannels(body);
   if (adminSubTab === "withdrawals") return adminWithdrawals(body);
   if (adminSubTab === "users")       return adminUsers(body);
+  if (adminSubTab === "ads")         return adminAds(body);
   if (adminSubTab === "settings")    return adminSettings(body);
   if (adminSubTab === "broadcast")   return adminBroadcast(body);
 }
@@ -1217,6 +1220,54 @@ async function adjustBalance(uid){
   await api("/api/admin/users/balance", { user_id: uid, amount: amt });
   toast("✅ Balance updated");
   searchUser();
+}
+
+/* ── Admin: Ads Analytics ─────────────────────────────────────── */
+async function adminAds(body){
+  let a;
+  try {
+    a = await api("/api/admin/ads/analytics");
+  } catch (e) {
+    body.innerHTML = `<div class="empty">Couldn't load ad analytics.</div>`;
+    return;
+  }
+
+  const userRow = (u) => `
+    <div class="list-item">
+      <div>
+        <div style="font-weight:700">${escapeHtml(u.full_name || "—")} ${u.username ? "@"+escapeHtml(u.username) : ""}</div>
+        <div class="mini">ID: ${u.user_id}</div>
+      </div>
+      <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">${u.watched}</div>
+    </div>`;
+
+  const videoLimitList = a.video_limit_reached_users.length
+    ? a.video_limit_reached_users.map(userRow).join("")
+    : `<div class="empty">No one has hit the Watch Ad daily limit today.</div>`;
+
+  const dlLimitList = a.direct_link_limit_reached_users.length
+    ? a.direct_link_limit_reached_users.map(userRow).join("")
+    : `<div class="empty">No one has hit the Direct Link daily limit today.</div>`;
+
+  body.innerHTML = `
+    <h2 class="sect" style="margin-top:0">🎬 Watch Ad — Today</h2>
+    <div class="card stat-row" style="margin-bottom:14px">
+      <div class="stat-box"><div class="n">${a.video_clicks_today}</div><div class="l">Clicked to Watch</div></div>
+      <div class="stat-box"><div class="n">${a.video_completed_today}</div><div class="l">Finished Watching</div></div>
+    </div>
+
+    <h2 class="sect">🔗 Direct Link — Today</h2>
+    <div class="card stat-row" style="margin-bottom:14px">
+      <div class="stat-box"><div class="n">${a.direct_link_opened_today}</div><div class="l">Opened Link</div></div>
+      <div class="stat-box"><div class="n">${a.direct_link_completed_today}</div><div class="l">Claimed Reward</div></div>
+    </div>
+
+    <h2 class="sect">✅ Reached Watch Ad Daily Limit</h2>
+    <div class="card">${videoLimitList}</div>
+
+    <h2 class="sect">✅ Reached Direct Link Daily Limit</h2>
+    <div class="card">${dlLimitList}</div>
+  `;
 }
 
 /* ── Admin: Settings ──────────────────────────────────────────── */
