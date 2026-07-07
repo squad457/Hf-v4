@@ -33,7 +33,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo
+    WebAppInfo, FSInputFile
 )
 
 from fastapi import FastAPI, Request, HTTPException
@@ -60,6 +60,12 @@ logger.info("══════════════════════�
 BOT_TOKEN            = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
 PAYMENT_LOG_CHANNEL  = os.getenv("PAYMENT_LOG_CHANNEL", "").strip()
+# Private channel (only you, the admin, should be a member of it) that
+# receives a copy of the SQLite database file on a schedule — a safety
+# net in case the Railway Volume is ever lost/corrupted. Leave empty to
+# disable backups entirely.
+DB_BACKUP_CHANNEL_ID   = os.getenv("DB_BACKUP_CHANNEL_ID", "").strip()
+DB_BACKUP_INTERVAL_HOURS = int(os.getenv("DB_BACKUP_INTERVAL_HOURS", "24"))
 # WEBAPP_URL = this backend's OWN public URL (Railway). Used for API calls
 # and to build the /verify page link. Kept for backward compatibility.
 WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("/")
@@ -1575,6 +1581,7 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🚫 Ban User",            callback_data="adm_cmd_ban"),
             InlineKeyboardButton(text="✅ Unban Dashboard",     callback_data="adm_cmd_unban_menu"),
         ],
+        [InlineKeyboardButton(text="💾 Backup DB Now",         callback_data="adm_cmd_backup_now")],
         [InlineKeyboardButton(text="🛑 STOP BOT ENGINE",        callback_data="adm_stop_bot_confirm1")],
         [InlineKeyboardButton(text="🔙 Back to Main Menu",      callback_data="ui_return_home")],
     ])
@@ -2153,6 +2160,19 @@ async def process_stats(callback: CallbackQuery):
         f"• Outstanding Liabilities: <b>{float(row[1] or 0.0):.2f} ETB</b>\n"
         f"• Banned IPs: <b>{ip_count}</b>\n"
         f"• Fraud Log Entries: <b>{fraud_count}</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
+
+@core_router.callback_query(F.data == "adm_cmd_backup_now")
+async def process_backup_now(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    if not DB_BACKUP_CHANNEL_ID:
+        await callback.answer("⚠️ DB_BACKUP_CHANNEL_ID is not set in Railway Variables.", show_alert=True)
+        return
+    await callback.answer("📤 Sending backup…")
+    await send_db_backup()
+    await callback.message.edit_text(
+        "✅ <b>Backup sent</b> to your private backup channel.",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -3328,6 +3348,39 @@ async def api_admin_broadcast(body: AdminBroadcastRequest):
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# DATABASE BACKUPS — periodically ships a copy of the SQLite file to a
+# private Telegram channel (only you should be a member of it). This is
+# a safety net in case the Railway Volume itself is ever lost/corrupted;
+# it does NOT replace the Volume, it's a second, independent copy.
+# ═════════════════════════════════════════════════════════════════════════
+async def send_db_backup():
+    if not DB_BACKUP_CHANNEL_ID:
+        return
+    if not os.path.exists(DB_PATH):
+        logger.warning(f"DB backup skipped — {DB_PATH} does not exist yet")
+        return
+    try:
+        stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-UTC")
+        await bot.send_document(
+            chat_id=DB_BACKUP_CHANNEL_ID,
+            document=FSInputFile(DB_PATH, filename=f"referral_bot_{stamp}.db"),
+            caption=f"🗄 Automatic DB backup — {stamp}",
+        )
+        logger.info(f"DB backup sent to {DB_BACKUP_CHANNEL_ID}")
+    except Exception as e:
+        logger.warning(f"DB backup failed: {e}")
+
+
+async def db_backup_loop():
+    # Send one right away at startup so there's always a fresh copy, then
+    # repeat on the configured interval for as long as the process runs.
+    await send_db_backup()
+    while True:
+        await asyncio.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
+        await send_db_backup()
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT — runs the Telegram long-poller AND the Mini App web server
 # in the same process (this is what Railway's "web: python bot.py" and
 # healthcheckPath "/health" in railway.toml expect).
@@ -3348,6 +3401,7 @@ async def _main():
     except Exception as e:
         logger.warning(f"Could not fetch bot identity at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    asyncio.create_task(db_backup_loop())
     await _run_web_server()
 
 
