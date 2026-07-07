@@ -259,6 +259,28 @@ CREATE INDEX IF NOT EXISTS idx_task_progress_user ON task_progress(user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_position     ON tasks(position);
 
 -- ─────────────────────────────────────────────────────────────────────────
+-- ADSGRAM — REWARDED VIDEO + DIRECT LINK
+-- kind: 'video'       (AdsGram SDK rewarded interstitial, completion
+--                       confirmed client-side by the SDK promise, then
+--                       claimed straight away — no wait timer needed)
+--     | 'direct_link' (AdsGram Direct Link/Smart Link — no SDK callback
+--                       exists for this format, so we use the same
+--                       open → wait → claim pattern as 'fake' tasks)
+-- status: 'pending' (direct_link opened, waiting out the timer)
+--       | 'completed'
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ad_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER,
+    kind         TEXT    NOT NULL,
+    status       TEXT    DEFAULT 'pending',
+    reward       REAL    DEFAULT 0,
+    started_at   TEXT    DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ad_events_user_kind ON ad_events(user_id, kind, completed_at);
+
+-- ─────────────────────────────────────────────────────────────────────────
 -- PERFORMANCE INDEXES
 -- ብዙ users ሲኖሩ balance/referrals/withdraw ቁልፎች የሚጠቀሙባቸውን query ዎች
 -- (referred_by lookups, fingerprint/ip correlation, withdrawal status)
@@ -279,6 +301,20 @@ CREATE INDEX IF NOT EXISTS idx_users_last_seen      ON users(last_seen);
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
+
+-- AdsGram — rewarded video
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_block_id', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_reward_amount', '0.5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_daily_limit', '10');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '30');
+
+-- AdsGram — Direct Link
+INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_direct_link', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_reward_amount', '0.3');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_daily_limit', '10');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_wait_seconds', '15');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_cooldown_seconds', '30');
 
 INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
@@ -646,6 +682,74 @@ class DataEngine:
             DataEngine._settings_cache[key] = value
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+            await db.commit()
+
+    # ── AdsGram: rewarded video + direct link ──────────────────────────
+    @staticmethod
+    async def count_ad_events_today(user_id: int, kind: str) -> int:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind=? AND status='completed' "
+                "AND date(completed_at) = date('now')",
+                (user_id, kind),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    @staticmethod
+    async def get_last_ad_event(user_id: int, kind: str):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT completed_at FROM ad_events WHERE user_id=? AND kind=? AND status='completed' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                (user_id, kind),
+            )
+            row = await cur.fetchone()
+            return row["completed_at"] if row else None
+
+    @staticmethod
+    async def record_ad_event(user_id: int, kind: str, reward: float):
+        """Straight-to-completed event — used for rewarded video, whose
+        completion is already confirmed client-side by the AdsGram SDK
+        promise before this is ever called."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
+                "VALUES (?, ?, 'completed', ?, datetime('now'))",
+                (user_id, kind, reward),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def start_ad_event(user_id: int, kind: str) -> int:
+        """Opens a 'pending' event — used for Direct Link, which has no
+        SDK callback, so we gate the reward behind a server-side wait
+        timer instead (same trust model as 'fake' tasks)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status) VALUES (?, ?, 'pending')",
+                (user_id, kind),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    @staticmethod
+    async def get_ad_event(event_id: int, user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM ad_events WHERE id=? AND user_id=?", (event_id, user_id)
+            )
+            return await cur.fetchone()
+
+    @staticmethod
+    async def complete_ad_event(event_id: int, reward: float):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE ad_events SET status='completed', reward=?, completed_at=datetime('now') WHERE id=?",
+                (reward, event_id),
+            )
             await db.commit()
 
     @staticmethod
@@ -2521,6 +2625,172 @@ async def api_gate_fake_seen(body: ApiBase):
     return {"ok": True}
 
 
+# ── /api/ads/* — AdsGram rewarded video + Direct Link ────────────────────
+AD_KIND_VIDEO  = "video"
+AD_KIND_DIRECT = "direct_link"
+
+
+@api_app.post("/api/ads/status")
+async def api_ads_status(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled      = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    block_id         = await DataEngine.get_setting("adsgram_block_id", "") or ""
+    reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+    daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
+    seconds_left = 0
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_VIDEO)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            seconds_left = max(0, int(cooldown_seconds - elapsed))
+        except Exception:
+            pass
+
+    direct_link         = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    dl_reward           = float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"))
+    dl_daily_limit       = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    dl_wait_seconds      = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+    dl_cooldown_seconds  = int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"))
+    dl_watched_today     = await DataEngine.count_ad_events_today(uid, AD_KIND_DIRECT)
+    dl_seconds_left = 0
+    dl_last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_DIRECT)
+    if dl_last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(dl_last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            dl_seconds_left = max(0, int(dl_cooldown_seconds - elapsed))
+        except Exception:
+            pass
+
+    return {
+        "enabled": ads_enabled and bool(block_id),
+        "block_id": block_id,
+        "reward_amount": reward_amount,
+        "daily_limit": daily_limit,
+        "watched_today": watched_today,
+        "seconds_left": seconds_left,
+        "direct_link": {
+            "enabled": ads_enabled and bool(direct_link),
+            "url": direct_link,
+            "reward_amount": dl_reward,
+            "daily_limit": dl_daily_limit,
+            "watched_today": dl_watched_today,
+            "seconds_left": dl_seconds_left,
+            "wait_seconds": dl_wait_seconds,
+        },
+    }
+
+
+@api_app.post("/api/ads/claim")
+async def api_ads_claim(body: ApiBase):
+    """Rewarded video — the AdsGram SDK promise on the frontend already
+    confirmed the ad played to completion before this is ever called, so
+    we only need to re-check the daily cap / cooldown server-side (the
+    SDK promise resolving is not, by itself, something to trust for
+    payouts — a compromised client could call this directly)."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    block_id = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
+    if not ads_enabled or not block_id:
+        raise HTTPException(status_code=400, detail="ads_disabled")
+
+    daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
+    reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
+    if watched_today >= daily_limit:
+        raise HTTPException(status_code=400, detail="daily_limit_reached")
+
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_VIDEO)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HTTPException(status_code=400, detail="cooldown_active")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    await DataEngine.record_ad_event(uid, AD_KIND_VIDEO, reward_amount)
+    await DataEngine.add_balance(uid, reward_amount)
+    return {"credited": reward_amount}
+
+
+@api_app.post("/api/ads/direct-link/open")
+async def api_ads_direct_link_open(body: ApiBase):
+    """Direct Link has no SDK callback to confirm anything happened, so
+    the reward is gated behind a server-timed wait (same trust model as
+    the 'fake' task type already used for unverifiable channel joins)."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    direct_link = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    if not ads_enabled or not direct_link:
+        raise HTTPException(status_code=400, detail="direct_link_disabled")
+
+    daily_limit      = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"))
+    wait_seconds     = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_DIRECT)
+    if watched_today >= daily_limit:
+        raise HTTPException(status_code=400, detail="daily_limit_reached")
+
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_DIRECT)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HTTPException(status_code=400, detail="cooldown_active")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    event_id = await DataEngine.start_ad_event(uid, AD_KIND_DIRECT)
+    return {"url": direct_link, "event_id": event_id, "wait_seconds": wait_seconds}
+
+
+class AdDirectLinkClaimRequest(ApiBase):
+    event_id: int
+
+
+@api_app.post("/api/ads/direct-link/claim")
+async def api_ads_direct_link_claim(body: AdDirectLinkClaimRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    wait_seconds  = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+    reward_amount = float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"))
+
+    event = await DataEngine.get_ad_event(body.event_id, uid)
+    if not event or event["kind"] != AD_KIND_DIRECT or event["status"] == "completed":
+        raise HTTPException(status_code=400, detail="not_claimable")
+
+    try:
+        started_dt = datetime.strptime(event["started_at"], "%Y-%m-%d %H:%M:%S")
+        elapsed = (datetime.utcnow() - started_dt).total_seconds()
+    except Exception:
+        elapsed = wait_seconds
+
+    if elapsed < wait_seconds:
+        raise HTTPException(status_code=400, detail=f"wait:{int(wait_seconds - elapsed)}")
+
+    await DataEngine.complete_ad_event(body.event_id, reward_amount)
+    await DataEngine.add_balance(uid, reward_amount)
+    fresh = await DataEngine.get_user(uid)
+    return {"credited": reward_amount, "balance": float(fresh["balance"])}
+
+
 # ── /api/tasks — user-facing task list + join/check/claim ───────────────
 async def _build_task_view(user_id: int) -> list:
     tasks = await DataEngine.get_tasks(active_only=True)
@@ -2877,12 +3147,37 @@ async def api_admin_settings(body: ApiBase):
     _require_admin(user)
     rate = await DataEngine.get_setting("reward_per_referral", "10")
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
-    return {"reward_per_referral": float(rate), "min_withdrawal": float(min_w)}
+    return {
+        "reward_per_referral": float(rate),
+        "min_withdrawal": float(min_w),
+        # AdsGram — rewarded video
+        "ads_enabled": (await DataEngine.get_setting("ads_enabled", "0")) == "1",
+        "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", "") or "",
+        "ad_reward_amount": float(await DataEngine.get_setting("ad_reward_amount", "0.5")),
+        "ad_daily_limit": int(await DataEngine.get_setting("ad_daily_limit", "10")),
+        "ad_cooldown_seconds": int(await DataEngine.get_setting("ad_cooldown_seconds", "30")),
+        # AdsGram — Direct Link
+        "adsgram_direct_link": await DataEngine.get_setting("adsgram_direct_link", "") or "",
+        "direct_link_reward_amount": float(await DataEngine.get_setting("direct_link_reward_amount", "0.3")),
+        "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
+        "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
+        "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+    }
 
 
 class AdminSettingsUpdateRequest(ApiBase):
     reward_per_referral: float
     min_withdrawal: float
+    ads_enabled: bool = False
+    adsgram_block_id: str = ""
+    ad_reward_amount: float = 0.5
+    ad_daily_limit: int = 10
+    ad_cooldown_seconds: int = 30
+    adsgram_direct_link: str = ""
+    direct_link_reward_amount: float = 0.3
+    direct_link_daily_limit: int = 10
+    direct_link_wait_seconds: int = 15
+    direct_link_cooldown_seconds: int = 30
 
 
 @api_app.post("/api/admin/settings/update")
@@ -2891,7 +3186,38 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     _require_admin(user)
     await DataEngine.set_setting("reward_per_referral", str(body.reward_per_referral))
     await DataEngine.set_setting("min_withdrawal", str(body.min_withdrawal))
+    await DataEngine.set_setting("ads_enabled", "1" if body.ads_enabled else "0")
+    await DataEngine.set_setting("adsgram_block_id", body.adsgram_block_id.strip())
+    await DataEngine.set_setting("ad_reward_amount", str(body.ad_reward_amount))
+    await DataEngine.set_setting("ad_daily_limit", str(body.ad_daily_limit))
+    await DataEngine.set_setting("ad_cooldown_seconds", str(body.ad_cooldown_seconds))
+    await DataEngine.set_setting("adsgram_direct_link", body.adsgram_direct_link.strip())
+    await DataEngine.set_setting("direct_link_reward_amount", str(body.direct_link_reward_amount))
+    await DataEngine.set_setting("direct_link_daily_limit", str(body.direct_link_daily_limit))
+    await DataEngine.set_setting("direct_link_wait_seconds", str(body.direct_link_wait_seconds))
+    await DataEngine.set_setting("direct_link_cooldown_seconds", str(body.direct_link_cooldown_seconds))
     return {"ok": True}
+
+
+# ── /api/admin/ads/verify — connection check shown in the dashboard ─────
+@api_app.post("/api/admin/ads/verify")
+async def api_admin_ads_verify(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    block_id     = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
+    direct_link  = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    ads_enabled  = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    video_ready  = ads_enabled and bool(block_id)
+    link_ready   = ads_enabled and direct_link.lower().startswith(("http://", "https://"))
+    return {
+        "sdk_script_present": True,  # sad.min.js is loaded in frontend/app.html <head>
+        "ads_enabled": ads_enabled,
+        "block_id_configured": bool(block_id),
+        "direct_link_configured": bool(direct_link),
+        "direct_link_valid_url": link_ready,
+        "video_ready": video_ready,
+        "direct_link_ready": link_ready,
+    }
 
 
 # ── /api/admin/broadcast — free-text announcement to all users ──────────
