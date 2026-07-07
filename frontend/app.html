@@ -323,7 +323,7 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   </div>
   <div class="splash-word">HF <span>EARN</span></div>
   <div class="splash-track"><i></i></div>
-  <div class="splash-sub">Loading your card</div>
+  <div class="splash-sub">Dashboard</div>
 </div>
 
 <div id="gate" style="display:none">
@@ -347,7 +347,7 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 
 <div class="wrap">
   <div class="topbar">
-    <div class="brand"><span class="dot"></span>HF Earn</div>
+    <div class="brand"><span class="dot"></span>HF Earn money v4</div>
     <div class="bal-chip" id="topBal">— Birr</div>
   </div>
   <div id="view"></div>
@@ -475,7 +475,7 @@ async function renderHome(view){
     <div class="hero">
       <div class="hero-top">
         <div class="chip"></div>
-        <div class="netmark">HF Earn<small>Digital Balance</small></div>
+        <div class="netmark">HF Earn money v4<small>Digital Balance</small></div>
       </div>
       <div class="label">Available Balance</div>
       <div class="amount">${fmt(ME.balance)}<span>Birr</span></div>
@@ -598,14 +598,31 @@ async function watchAd(){
     return toast("❌ Couldn't load ads — try again shortly");
   }
   const btn = document.getElementById("watchAdBtn");
-  if (!adController) adController = window.Adsgram.init({ blockId: ADS.block_id });
+  if (!adController){
+    adController = window.Adsgram.init({ blockId: ADS.block_id });
+    // Without these listeners, AdsGram shows its own raw technical popup
+    // (e.g. "Block xxx is not active") whenever no ad can be served.
+    // Subscribing here suppresses that default alert — we show our own
+    // friendly message instead, always in English.
+    const noAdsMsg = () => toast("⌛ No ads available right now — please try again later");
+    adController.addEventListener("onBannerNotFound", noAdsMsg);
+    adController.addEventListener("onNonStopShow",    noAdsMsg);
+    adController.addEventListener("onTooLongSession", noAdsMsg);
+  }
   if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
 
   try {
     await adController.show();
   } catch (adErr) {
-    // User closed/skipped the ad, or it failed to load — no reward, nothing to claim.
-    toast("⚠️ Ad not completed — no reward");
+    // adErr.state tells us roughly what happened:
+    //  'load'    → no ad was available to show at all
+    //  'render'  → ad found but failed to display
+    //  'playing' → ad was showing, then closed/skipped early
+    const state = adErr?.state;
+    const msg = (state === "load" || state === "render")
+      ? "⌛ No ads available right now — please try again later"
+      : "⚠️ Ad not completed — no reward";
+    toast(msg);
     await renderHome(document.getElementById("view"));
     return;
   }
@@ -872,7 +889,7 @@ async function renderWithdraw(view){
     <h2 class="sect" style="margin-top:0">Request Withdrawal</h2>
     <div class="card">
       <label class="f">Amount (Birr) — min ${fmt(ME.min_withdrawal)}</label>
-      <input type="number" id="wAmount" placeholder="e.g. 100">
+      <input type="number" id="wAmount" placeholder="e.g. ${fmt(ME.min_withdrawal)}">
       <label class="f">Telebirr Phone Number</label>
       <input type="text" id="wPhone" placeholder="09xxxxxxxx">
       <label class="f">Full Name</label>
