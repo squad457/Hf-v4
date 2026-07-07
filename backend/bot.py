@@ -931,6 +931,20 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
+    async def mark_task_checked(user_id: int, task_id: int):
+        # Only a user who has passed a *real* verification (membership
+        # confirmed, or wait-timer elapsed for a fake task) is allowed to
+        # move from 'joined' -> 'checked'. /api/tasks/claim requires this
+        # status before it will pay out, so the reward can never be
+        # farmed by calling /api/tasks/claim directly and skipping /check.
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE task_progress SET status='checked' WHERE user_id = ? AND task_id = ? AND status = 'joined'",
+                (user_id, task_id),
+            )
+            await db.commit()
+
+    @staticmethod
     async def mark_task_completed(user_id: int, task_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -2969,6 +2983,11 @@ async def api_tasks_check(body: TaskActionRequest):
             # legitimate user over a misconfigured channel (same policy
             # as inspect_compulsory_memberships above).
             pass
+    # Only reachable once the wait timer has elapsed AND (for a "force"
+    # task) real membership has been confirmed above. Record that this
+    # user has passed a genuine check — /api/tasks/claim will refuse to
+    # pay out without this, so a reward is never handed out for free.
+    await DataEngine.mark_task_checked(uid, body.task_id)
     return {"ok": True}
 
 
@@ -2982,6 +3001,11 @@ async def api_tasks_claim(body: TaskActionRequest):
     prog = await DataEngine.get_task_progress(uid, body.task_id)
     if not prog or prog["status"] == "completed":
         raise HTTPException(status_code=400, detail="not_claimable")
+    if prog["status"] != "checked":
+        # Guards against calling /api/tasks/claim directly (skipping
+        # /api/tasks/check) to collect a reward without ever actually
+        # joining / passing verification.
+        raise HTTPException(status_code=400, detail="not_checked")
     await DataEngine.mark_task_completed(uid, body.task_id)
     await DataEngine.add_balance(uid, float(task["reward"]))
     fresh = await DataEngine.get_user(uid)
