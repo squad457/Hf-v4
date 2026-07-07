@@ -85,7 +85,7 @@ TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 # recommends checking auth_date for exactly this reason.
 MAX_INIT_DATA_AGE_SECONDS = int(os.getenv("MAX_INIT_DATA_AGE_SECONDS", str(6 * 3600)))
 
-TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
+TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAIBImpM6RKFmzDV8HLYo0XHukkMK-RaAAI-D2sbGJdwUazZrBH4OObkAQADAgADeAADPAQ"
 
 if not WEBAPP_URL.startswith(("http://", "https://")):
     WEBAPP_URL = f"https://{WEBAPP_URL}"
