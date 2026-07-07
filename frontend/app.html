@@ -378,7 +378,7 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   <button class="nav-btn" id="adminNavBtn" data-tab="admin" style="display:none"><span class="ic">⚙️</span>Admin</button>
 </div>
 
-<button class="support-fab" id="supportFab" style="display:none" title="Contact Support">🎧</button>
+<button class="support-fab" id="supportFab" style="display:none" title="Contact Support">👨‍🔧</button>
 
 <script>
 /* ══════════════════════════════════════════════════════════════════
@@ -783,6 +783,18 @@ async function renderTasks(view){
       return;
     }
 
+    if (action === "rejoin"){
+      // Falls back to "join" after a failed check — re-opens the invite
+      // link so the user can actually join, then flips the button back
+      // to "Check" so they must verify again. No new /api/tasks/join
+      // call needed here: joined_at is INSERT OR IGNORE'd server-side,
+      // so the original wait-timer state is untouched.
+      if (t.invite_link) window.open(t.invite_link, "_blank");
+      t.uiStage = "check";
+      paint();
+      return;
+    }
+
     if (action === "check"){
       t.uiStage = "checking";
       paint();
@@ -792,12 +804,17 @@ async function renderTasks(view){
         t.uiStage = "claim";
         paint();
       } catch (e){
-        t.uiStage = "check";
         if (e.message.startsWith("wait:")){
+          t.uiStage = "check";
           toast(`⏳ Wait ${e.message.split(":")[1]}s more`);
         } else if (e.message === "not_member"){
-          toast("❌ You haven't joined the channel yet — join then tap Check again.");
+          // Real verification failed — don't just let them mash "Check"
+          // again. Force them back through "Join" so a reward can never
+          // be paid out to someone who hasn't actually joined.
+          t.uiStage = "join";
+          toast("❌ You haven't joined the channel yet — tap Join, then Check again.");
         } else {
+          t.uiStage = "check";
           toast("⚠️ Couldn't verify. Try again.");
         }
         paint();
@@ -818,8 +835,16 @@ async function renderTasks(view){
         }
         paint();
       } catch (e){
-        t.uiStage = "claim";
-        toast("⚠️ Something went wrong. Try again.");
+        if (e.message === "not_checked"){
+          // Shouldn't normally happen through the UI (Check always runs
+          // first), but if it does, send them back through Check rather
+          // than leaving a dead Claim button.
+          t.uiStage = "check";
+          toast("⚠️ Please tap Check again first.");
+        } else {
+          t.uiStage = "claim";
+          toast("⚠️ Something went wrong. Try again.");
+        }
         paint();
       }
     }
@@ -841,6 +866,10 @@ function taskCardHTML(t){
       btn = `<button class="task-btn claim" onclick="_taskAction(${t.id},'claim')">Claim</button>`;
     } else if (stage === "claiming"){
       btn = `<button class="task-btn claim dark-spin busy" disabled><span class="spin-ico"></span> Claiming</button>`;
+    } else if (stage === "join"){
+      // Check failed (not actually a member) — send them back to Join
+      // instead of leaving "Check" tappable forever.
+      btn = `<button class="task-btn join" onclick="_taskAction(${t.id},'rejoin')">Join</button>`;
     } else {
       btn = `<button class="task-btn check" onclick="_taskAction(${t.id},'check')">Check</button>`;
     }
@@ -1303,7 +1332,7 @@ async function adminSettings(body){
       <input id="stReward" type="number" value="${s.reward_per_referral}">
       <label class="f">Minimum Withdrawal (Birr)</label>
       <input id="stMinWd" type="number" value="${s.min_withdrawal}">
-      <label class="f">🎧 Support Telegram Username</label>
+      <label class="f">👨‍🔧 Support Telegram Username</label>
       <input id="stSupportUser" type="text" placeholder="e.g. hf_support (no @)" value="${escapeHtml(s.support_username || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
