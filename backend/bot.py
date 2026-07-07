@@ -69,7 +69,7 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "").rstrip("/") or WEBAPP_URL
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
-DB_PATH              = "referral_bot.db"
+DB_PATH               = os.getenv("DB_PATH", "referral_bot.db")
 TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 
 # How old a Telegram WebApp initData payload is allowed to be before we
@@ -720,6 +720,72 @@ class DataEngine:
                 (user_id, kind, reward),
             )
             await db.commit()
+
+    @staticmethod
+    async def log_ad_click(user_id: int, kind: str):
+        """Lightweight analytics-only row — logged the moment a user taps
+        'Watch Ad' / opens the ad, BEFORE we know whether they'll finish
+        it. Never touched by the reward/daily-limit logic (that only
+        ever counts status='completed'), so this is purely for the
+        admin 'clicks vs completions' dashboard."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status) VALUES (?, ?, 'clicked')",
+                (user_id, kind),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_ads_admin_analytics(video_daily_limit: int, direct_link_daily_limit: int) -> dict:
+        """Admin-facing ad analytics: how many people clicked vs finished
+        today, plus who has hit today's daily limit (with username)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            async def scalar(query, params=()):
+                cur = await db.execute(query, params)
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
+            video_clicks = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='video' AND status='clicked' AND date(started_at)=date('now')"
+            )
+            video_completed = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='video' AND status='completed' AND date(completed_at)=date('now')"
+            )
+            dl_opened = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='direct_link' AND date(started_at)=date('now')"
+            )
+            dl_completed = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='direct_link' AND status='completed' AND date(completed_at)=date('now')"
+            )
+
+            async def limit_reached(kind: str, limit: int):
+                cur = await db.execute(
+                    "SELECT u.user_id, u.username, u.full_name, COUNT(*) AS watched "
+                    "FROM ad_events e JOIN users u ON u.user_id = e.user_id "
+                    "WHERE e.kind=? AND e.status='completed' AND date(e.completed_at)=date('now') "
+                    "GROUP BY e.user_id HAVING watched >= ? ORDER BY watched DESC",
+                    (kind, limit),
+                )
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+            video_limit_users = await limit_reached("video", video_daily_limit)
+            dl_limit_users    = await limit_reached("direct_link", direct_link_daily_limit)
+
+            return {
+                "video_clicks_today":              video_clicks,
+                "video_completed_today":            video_completed,
+                "direct_link_opened_today":          dl_opened,
+                "direct_link_completed_today":       dl_completed,
+                "video_limit_reached_users":         video_limit_users,
+                "direct_link_limit_reached_users":   dl_limit_users,
+            }
 
     @staticmethod
     async def start_ad_event(user_id: int, kind: str) -> int:
@@ -2630,6 +2696,22 @@ AD_KIND_VIDEO  = "video"
 AD_KIND_DIRECT = "direct_link"
 
 
+class AdClickRequest(ApiBase):
+    kind: str = "video"
+
+
+@api_app.post("/api/ads/click")
+async def api_ads_click(body: AdClickRequest):
+    """Fire-and-forget analytics ping — called the instant the user taps
+    'Watch Ad', before we know if they'll actually finish it. Purely for
+    the admin 'clicks vs completions' dashboard; never affects rewards
+    or daily limits."""
+    user = await _authenticate(body)
+    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT) else AD_KIND_VIDEO
+    await DataEngine.log_ad_click(user["user_id"], kind)
+    return {"ok": True}
+
+
 @api_app.post("/api/ads/status")
 async def api_ads_status(body: ApiBase):
     user = await _authenticate(body)
@@ -2920,6 +3002,16 @@ async def api_admin_stats_overview(body: ApiBase):
     _require_admin(user)
     total, online = await DataEngine.get_user_activity_stats()
     return {"total_users": total, "online_users": online}
+
+
+# ── /api/admin/ads/analytics — clicks vs completions + daily-limit list ──
+@api_app.post("/api/admin/ads/analytics")
+async def api_admin_ads_analytics(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    video_daily_limit = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    dl_daily_limit     = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    return await DataEngine.get_ads_admin_analytics(video_daily_limit, dl_daily_limit)
 
 
 # ── /api/admin/tasks/* ────────────────────────────────────────────────────
