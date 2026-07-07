@@ -502,11 +502,11 @@ async function renderHome(view){
 
 /* ── Rewarded ads (AdsGram) ─────────────────────────────────────── */
 function adsCardHTML(){
-  if (!ADS || !ADS.block_id) return "";
-  const capped = ADS.watched_today >= ADS.daily_limit;
-  return `
-    <h2 class="sect">Watch & Earn</h2>
-    <div class="card" id="adsCard" style="border-color:rgba(200,242,77,.18)">
+  if (!ADS || (!ADS.block_id && !ADS.direct_link?.url)) return "";
+
+  const videoBlock = ADS.block_id ? (() => {
+    const capped = ADS.watched_today >= ADS.daily_limit;
+    return `
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
         <div>
           <div style="font-weight:700;font-size:.86rem">🎬 Watch an Ad</div>
@@ -517,29 +517,77 @@ function adsCardHTML(){
       <button class="btn" id="watchAdBtn" onclick="watchAd()" ${(!ADS.enabled || capped) ? "disabled" : ""}>
         ${capped ? "✅ Daily Limit Reached" : "▶️ Watch Ad"}
       </button>
+    `;
+  })() : "";
+
+  const dl = ADS.direct_link;
+  const directLinkBlock = (dl && dl.url) ? (() => {
+    const dlCapped = dl.watched_today >= dl.daily_limit;
+    return `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:${videoBlock ? "16px" : "0"} 0 12px;">
+        <div>
+          <div style="font-weight:700;font-size:.86rem">🔗 Direct Link Ad</div>
+          <div class="mini" style="margin-top:2px">Earn ${fmt(dl.reward_amount)} Birr per visit</div>
+        </div>
+        <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">${dl.watched_today}/${dl.daily_limit}</div>
+      </div>
+      <button class="btn ghost" id="directLinkBtn" onclick="openDirectLinkAd()" ${(!dl.enabled || dlCapped) ? "disabled" : ""}>
+        ${dlCapped ? "✅ Daily Limit Reached" : "🔗 Open Direct Link"}
+      </button>
+    `;
+  })() : "";
+
+  return `
+    <h2 class="sect">Watch & Earn</h2>
+    <div class="card" id="adsCard" style="border-color:rgba(200,242,77,.18)">
+      ${videoBlock}${directLinkBlock}
     </div>
   `;
 }
 
 function startAdCooldownTicker(){
   clearInterval(window._adTick);
-  if (!ADS || ADS.seconds_left <= 0) return;
-  let left = ADS.seconds_left;
-  const btn = document.getElementById("watchAdBtn");
-  if (!btn) return;
-  btn.disabled = true;
-  const label = () => `⏳ Wait ${left}s`;
-  btn.textContent = label();
-  window._adTick = setInterval(() => {
-    left -= 1;
-    if (left <= 0){
-      clearInterval(window._adTick);
-      btn.disabled = false;
-      btn.textContent = "▶️ Watch Ad";
-    } else {
+  if (ADS && ADS.seconds_left > 0){
+    let left = ADS.seconds_left;
+    const btn = document.getElementById("watchAdBtn");
+    if (btn){
+      btn.disabled = true;
+      const label = () => `⏳ Wait ${left}s`;
       btn.textContent = label();
+      window._adTick = setInterval(() => {
+        left -= 1;
+        if (left <= 0){
+          clearInterval(window._adTick);
+          btn.disabled = false;
+          btn.textContent = "▶️ Watch Ad";
+        } else {
+          btn.textContent = label();
+        }
+      }, 1000);
     }
-  }, 1000);
+  }
+
+  clearInterval(window._dlTick);
+  const dl = ADS?.direct_link;
+  if (dl && dl.seconds_left > 0){
+    let left = dl.seconds_left;
+    const btn = document.getElementById("directLinkBtn");
+    if (btn){
+      btn.disabled = true;
+      const label = () => `⏳ Wait ${left}s`;
+      btn.textContent = label();
+      window._dlTick = setInterval(() => {
+        left -= 1;
+        if (left <= 0){
+          clearInterval(window._dlTick);
+          btn.disabled = false;
+          btn.textContent = "🔗 Open Direct Link";
+        } else {
+          btn.textContent = label();
+        }
+      }, 1000);
+    }
+  }
 }
 
 async function watchAd(){
@@ -576,6 +624,55 @@ async function watchAd(){
     toast(msg);
   }
   await renderHome(document.getElementById("view"));
+}
+
+/* ── Direct Link ads (AdsGram Direct Link / Smart Link) ────────────
+   There's no SDK callback for this format — we can't know whether the
+   person actually looked at anything on the other end. So the flow is
+   open link → wait out a short timer → claim, the same trust model
+   already used for "fake" channel-join tasks, not the SDK-confirmed
+   flow rewarded video gets. */
+async function openDirectLinkAd(){
+  const btn = document.getElementById("directLinkBtn");
+  if (btn){ btn.disabled = true; btn.textContent = "Opening…"; }
+
+  let res;
+  try {
+    res = await api("/api/ads/direct-link/open", {});
+  } catch (e) {
+    const msg = e?.message === "daily_limit_reached" ? "❌ Daily limit reached"
+              : e?.message === "cooldown_active"     ? "❌ Please wait a bit before the next one"
+              : e?.message === "direct_link_disabled" ? "❌ Not configured yet"
+              : "❌ Couldn't start — try again";
+    toast(msg);
+    await renderHome(document.getElementById("view"));
+    return;
+  }
+
+  if (tg?.openLink) tg.openLink(res.url);
+  else window.open(res.url, "_blank");
+
+  let left = res.wait_seconds;
+  const label = () => `⏳ Wait ${left}s`;
+  if (btn) btn.textContent = label();
+  clearInterval(window._dlTick);
+  window._dlTick = setInterval(async () => {
+    left -= 1;
+    if (left > 0){
+      if (btn) btn.textContent = label();
+      return;
+    }
+    clearInterval(window._dlTick);
+    if (btn){ btn.disabled = true; btn.textContent = "Claiming…"; }
+    try {
+      const r = await api("/api/ads/direct-link/claim", { event_id: res.event_id });
+      tg?.HapticFeedback?.notificationOccurred("success");
+      toast(`✅ +${fmt(r.credited)} Birr credited`);
+    } catch (claimErr) {
+      toast("⚠️ Couldn't credit the reward — try again");
+    }
+    await renderHome(document.getElementById("view"));
+  }, 1000);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1116,7 +1213,11 @@ async function adminSettings(body){
       <input id="stMinWd" type="number" value="${s.min_withdrawal}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
-    <h2 class="sect">AdsGram (Watch & Earn)</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+      <h2 class="sect" style="margin:0">AdsGram (Watch & Earn)</h2>
+      <button class="btn sm ghost" style="margin-top:14px" onclick="checkAdsgramConnection()">🔍 Check Connection</button>
+    </div>
+    <div id="adsgramCheckResult"></div>
     <div class="card">
       <label class="f">Enable Rewarded Ads</label>
       <select id="stAdsEnabled">
@@ -1133,6 +1234,20 @@ async function adminSettings(body){
       <input id="stAdCooldown" type="number" value="${s.ad_cooldown_seconds}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <h2 class="sect">AdsGram Direct Link</h2>
+    <div class="card">
+      <label class="f">Direct Link URL</label>
+      <input id="stAdDirectLink" type="text" placeholder="https://...adsgram direct link" value="${escapeHtml(s.adsgram_direct_link || '')}">
+      <label class="f">Reward per Visit (Birr)</label>
+      <input id="stAdDlReward" type="number" step="0.1" value="${s.direct_link_reward_amount}">
+      <label class="f">Daily Limit per User</label>
+      <input id="stAdDlDaily" type="number" value="${s.direct_link_daily_limit}">
+      <label class="f">Wait Timer Before Claim (seconds)</label>
+      <input id="stAdDlWait" type="number" value="${s.direct_link_wait_seconds}">
+      <label class="f">Cooldown Between Visits (seconds)</label>
+      <input id="stAdDlCooldown" type="number" value="${s.direct_link_cooldown_seconds}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
 async function saveSettings(){
@@ -1143,11 +1258,43 @@ async function saveSettings(){
   const ad_reward_amount = parseFloat(document.getElementById("stAdReward").value);
   const ad_daily_limit = parseInt(document.getElementById("stAdDaily").value, 10);
   const ad_cooldown_seconds = parseInt(document.getElementById("stAdCooldown").value, 10);
+  const adsgram_direct_link = document.getElementById("stAdDirectLink").value.trim();
+  const direct_link_reward_amount = parseFloat(document.getElementById("stAdDlReward").value);
+  const direct_link_daily_limit = parseInt(document.getElementById("stAdDlDaily").value, 10);
+  const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
+  const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
   await api("/api/admin/settings/update", {
     reward_per_referral, min_withdrawal,
     ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
+    adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
+    direct_link_wait_seconds, direct_link_cooldown_seconds,
   });
   toast("✅ Settings saved");
+}
+async function checkAdsgramConnection(){
+  const box = document.getElementById("adsgramCheckResult");
+  box.innerHTML = `<div class="mini" style="padding:8px 2px">Checking…</div>`;
+  try {
+    const r = await api("/api/admin/ads/verify");
+    const row = (ok, label) => `
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
+        <span>${ok ? "✅" : "❌"}</span><span class="mini">${label}</span>
+      </div>`;
+    box.innerHTML = `
+      <div class="card" style="padding:12px 14px;">
+        ${row(r.sdk_script_present, "AdsGram SDK script loaded in Mini App")}
+        ${row(r.ads_enabled, "Ads enabled in settings")}
+        ${row(r.block_id_configured, "Block ID configured (rewarded video)")}
+        ${row(r.direct_link_configured, "Direct Link URL configured")}
+        ${row(r.direct_link_valid_url, "Direct Link URL looks valid")}
+        <div style="margin-top:8px;font-weight:700;font-size:.82rem">
+          ${r.video_ready ? "✅ Rewarded video is live" : "⚠️ Rewarded video not fully configured"}<br>
+          ${r.direct_link_ready ? "✅ Direct Link is live" : "⚠️ Direct Link not fully configured"}
+        </div>
+      </div>`;
+  } catch (e){
+    box.innerHTML = `<div class="empty">Couldn't run the check.</div>`;
+  }
 }
 
 /* ── Admin: Broadcast ─────────────────────────────────────────── */
