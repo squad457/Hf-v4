@@ -270,6 +270,21 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 .nav-btn .ic{font-size:1.05rem;}
 .nav-btn.active{color:var(--lime);background:rgba(200,242,77,.1);}
 
+/* ── Support FAB (bottom corner) ────── */
+.support-fab{
+  position:fixed;right:16px;bottom:calc(88px + env(safe-area-inset-bottom));z-index:6;
+  width:46px;height:46px;border-radius:50%;border:none;cursor:pointer;
+  background:#2f8dfa;color:#fff;font-size:1.15rem;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 22px rgba(47,141,250,.45);
+  animation:fabPulse 2.4s ease-in-out infinite;
+}
+.support-fab:active{transform:scale(.93);}
+@keyframes fabPulse{
+  0%,100%{box-shadow:0 8px 22px rgba(47,141,250,.45);}
+  50%{box-shadow:0 8px 26px rgba(47,141,250,.75);}
+}
+
 /* ── Misc ───────────────────────────── */
 .copybox{display:flex;gap:8px;}
 .copybox input{margin-bottom:0;font-size:.74rem;font-family:'JetBrains Mono',monospace;}
@@ -362,6 +377,8 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   <button class="nav-btn" data-tab="withdraw"><span class="ic">💸</span>Withdraw</button>
   <button class="nav-btn" id="adminNavBtn" data-tab="admin" style="display:none"><span class="ic">⚙️</span>Admin</button>
 </div>
+
+<button class="support-fab" id="supportFab" style="display:none" title="Contact Support">🎧</button>
 
 <script>
 /* ══════════════════════════════════════════════════════════════════
@@ -464,8 +481,15 @@ async function refreshMe(){
   ME = await api("/api/me");
   document.getElementById("topBal").textContent = `${fmt(ME.balance)} Birr`;
   document.getElementById("adminNavBtn").style.display = ME.is_admin ? "flex" : "none";
+  document.getElementById("supportFab").style.display = ME.support_username ? "flex" : "none";
   return ME;
 }
+function openSupport(){
+  if (!ME || !ME.support_username) return;
+  const url = `https://t.me/${ME.support_username}`;
+  tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, "_blank");
+}
+document.getElementById("supportFab").addEventListener("click", openSupport);
 
 async function renderHome(view){
   await refreshMe();
@@ -1279,6 +1303,8 @@ async function adminSettings(body){
       <input id="stReward" type="number" value="${s.reward_per_referral}">
       <label class="f">Minimum Withdrawal (Birr)</label>
       <input id="stMinWd" type="number" value="${s.min_withdrawal}">
+      <label class="f">🎧 Support Telegram Username</label>
+      <input id="stSupportUser" type="text" placeholder="e.g. hf_support (no @)" value="${escapeHtml(s.support_username || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -1321,6 +1347,7 @@ async function adminSettings(body){
 async function saveSettings(){
   const reward_per_referral = parseFloat(document.getElementById("stReward").value);
   const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
+  const support_username = document.getElementById("stSupportUser").value.trim().replace(/^@/, "");
   const ads_enabled = document.getElementById("stAdsEnabled").value === "1";
   const adsgram_block_id = document.getElementById("stAdBlock").value.trim();
   const ad_reward_amount = parseFloat(document.getElementById("stAdReward").value);
@@ -1332,12 +1359,13 @@ async function saveSettings(){
   const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
   const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
   await api("/api/admin/settings/update", {
-    reward_per_referral, min_withdrawal,
+    reward_per_referral, min_withdrawal, support_username,
     ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
     adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
     direct_link_wait_seconds, direct_link_cooldown_seconds,
   });
   toast("✅ Settings saved");
+  refreshMe();
 }
 async function checkAdsgramConnection(){
   const box = document.getElementById("adsgramCheckResult");
