@@ -516,7 +516,7 @@ async function renderHome(view){
     </div>
     ${adsCardHTML()}
     <h2 class="sect">Quick Actions</h2>
-    <div class="card" style="display:flex;flex-direction:column;gap:8px;">
+    <div class="card" style="display:flex;flex-direction:column;gap:8px;padding-right:64px;">
       <button class="btn ghost" onclick="switchTab('withdraw')">💸 Request Withdrawal</button>
     </div>
     </div>
@@ -852,7 +852,10 @@ async function renderTasks(view){
 }
 
 function taskCardHTML(t){
-  const typeTag = t.task_type === "force" ? "" : `<span class="pill-tag fake">QUICK</span>`;
+  // No visible tag distinguishing "fake" (no real check) from "force"
+  // (real check) tasks in the user-facing list — they must look
+  // identical so users can't tell which ones are unverified.
+  const typeTag = "";
   let btn;
   if (t.status === "completed"){
     btn = `<button class="task-btn done" disabled>✓ Done</button>`;
