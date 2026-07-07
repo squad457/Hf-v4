@@ -10,6 +10,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://sad.adsgram.ai/js/sad.min.js"></script>
 <script src="config.js"></script>
 <style>
 /* ══════════════════════════════════════════════════════════════════
@@ -373,6 +374,8 @@ const _p = new URLSearchParams(location.search);
 const FORCE_ADMIN_TAB = _p.get("admin") === "1";
 
 let ME = null;
+let ADS = null;
+let adController = null;
 
 function toast(msg, type){
   if (!type){
@@ -466,6 +469,7 @@ async function refreshMe(){
 
 async function renderHome(view){
   await refreshMe();
+  ADS = await api("/api/ads/status").catch(() => null);
   view.innerHTML = `
     <div class="cascade">
     <div class="hero">
@@ -486,12 +490,92 @@ async function renderHome(view){
       <button class="btn gold" onclick="switchTab('tasks')">🧩 Do Tasks</button>
       <button class="btn ghost" onclick="switchTab('invite')">🔗 Invite Friends</button>
     </div>
+    ${adsCardHTML()}
     <h2 class="sect">Quick Actions</h2>
     <div class="card" style="display:flex;flex-direction:column;gap:8px;">
       <button class="btn ghost" onclick="switchTab('withdraw')">💸 Request Withdrawal</button>
     </div>
     </div>
   `;
+  if (ADS?.enabled) startAdCooldownTicker();
+}
+
+/* ── Rewarded ads (AdsGram) ─────────────────────────────────────── */
+function adsCardHTML(){
+  if (!ADS || !ADS.block_id) return "";
+  const capped = ADS.watched_today >= ADS.daily_limit;
+  return `
+    <h2 class="sect">Watch & Earn</h2>
+    <div class="card" id="adsCard" style="border-color:rgba(200,242,77,.18)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
+        <div>
+          <div style="font-weight:700;font-size:.86rem">🎬 Watch an Ad</div>
+          <div class="mini" style="margin-top:2px">Earn ${fmt(ADS.reward_amount)} Birr per view</div>
+        </div>
+        <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">${ADS.watched_today}/${ADS.daily_limit}</div>
+      </div>
+      <button class="btn" id="watchAdBtn" onclick="watchAd()" ${(!ADS.enabled || capped) ? "disabled" : ""}>
+        ${capped ? "✅ Daily Limit Reached" : "▶️ Watch Ad"}
+      </button>
+    </div>
+  `;
+}
+
+function startAdCooldownTicker(){
+  clearInterval(window._adTick);
+  if (!ADS || ADS.seconds_left <= 0) return;
+  let left = ADS.seconds_left;
+  const btn = document.getElementById("watchAdBtn");
+  if (!btn) return;
+  btn.disabled = true;
+  const label = () => `⏳ Wait ${left}s`;
+  btn.textContent = label();
+  window._adTick = setInterval(() => {
+    left -= 1;
+    if (left <= 0){
+      clearInterval(window._adTick);
+      btn.disabled = false;
+      btn.textContent = "▶️ Watch Ad";
+    } else {
+      btn.textContent = label();
+    }
+  }, 1000);
+}
+
+async function watchAd(){
+  if (!ADS?.block_id){
+    return toast("❌ Ads not configured yet");
+  }
+  if (!window.Adsgram){
+    return toast("❌ Couldn't load ads — try again shortly");
+  }
+  const btn = document.getElementById("watchAdBtn");
+  if (!adController) adController = window.Adsgram.init({ blockId: ADS.block_id });
+  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
+
+  try {
+    await adController.show();
+  } catch (adErr) {
+    // User closed/skipped the ad, or it failed to load — no reward, nothing to claim.
+    toast("⚠️ Ad not completed — no reward");
+    await renderHome(document.getElementById("view"));
+    return;
+  }
+
+  try {
+    // Ad watched to completion — ask OUR backend to credit it. The backend
+    // re-checks the daily cap and cooldown itself, so this call is the
+    // only thing that can actually move money, not the ad SDK's promise.
+    const res = await api("/api/ads/claim", {});
+    tg?.HapticFeedback?.notificationOccurred("success");
+    toast(`✅ +${fmt(res.credited)} Birr credited`);
+  } catch (claimErr) {
+    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
+              : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
+              : "❌ Couldn't credit the reward — try again";
+    toast(msg);
+  }
+  await renderHome(document.getElementById("view"));
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1032,12 +1116,37 @@ async function adminSettings(body){
       <input id="stMinWd" type="number" value="${s.min_withdrawal}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <h2 class="sect">AdsGram (Watch & Earn)</h2>
+    <div class="card">
+      <label class="f">Enable Rewarded Ads</label>
+      <select id="stAdsEnabled">
+        <option value="0" ${!s.ads_enabled ? "selected" : ""}>Disabled</option>
+        <option value="1" ${s.ads_enabled ? "selected" : ""}>Enabled</option>
+      </select>
+      <label class="f">AdsGram Block ID</label>
+      <input id="stAdBlock" type="text" placeholder="e.g. 12345" value="${escapeHtml(s.adsgram_block_id || '')}">
+      <label class="f">Reward per Ad (Birr)</label>
+      <input id="stAdReward" type="number" step="0.1" value="${s.ad_reward_amount}">
+      <label class="f">Daily Limit per User</label>
+      <input id="stAdDaily" type="number" value="${s.ad_daily_limit}">
+      <label class="f">Cooldown Between Ads (seconds)</label>
+      <input id="stAdCooldown" type="number" value="${s.ad_cooldown_seconds}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
 async function saveSettings(){
   const reward_per_referral = parseFloat(document.getElementById("stReward").value);
   const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
-  await api("/api/admin/settings/update", { reward_per_referral, min_withdrawal });
+  const ads_enabled = document.getElementById("stAdsEnabled").value === "1";
+  const adsgram_block_id = document.getElementById("stAdBlock").value.trim();
+  const ad_reward_amount = parseFloat(document.getElementById("stAdReward").value);
+  const ad_daily_limit = parseInt(document.getElementById("stAdDaily").value, 10);
+  const ad_cooldown_seconds = parseInt(document.getElementById("stAdCooldown").value, 10);
+  await api("/api/admin/settings/update", {
+    reward_per_referral, min_withdrawal,
+    ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
+  });
   toast("✅ Settings saved");
 }
 
