@@ -2683,6 +2683,7 @@ async def api_me(body: ApiBase):
         "total_earned_refs": round(direct * rate, 2),
         "referral_link": f"https://t.me/{uname}?start={user['user_id']}",
         "is_admin": evaluate_admin_access(user["user_id"]),
+        "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
 
 
@@ -3274,6 +3275,8 @@ async def api_admin_settings(body: ApiBase):
         "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
         "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
         "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+        # Support contact — shown as a floating support button in the dashboard
+        "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
 
 
@@ -3290,6 +3293,7 @@ class AdminSettingsUpdateRequest(ApiBase):
     direct_link_daily_limit: int = 10
     direct_link_wait_seconds: int = 15
     direct_link_cooldown_seconds: int = 30
+    support_username: str = ""
 
 
 @api_app.post("/api/admin/settings/update")
@@ -3308,6 +3312,7 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("direct_link_daily_limit", str(body.direct_link_daily_limit))
     await DataEngine.set_setting("direct_link_wait_seconds", str(body.direct_link_wait_seconds))
     await DataEngine.set_setting("direct_link_cooldown_seconds", str(body.direct_link_cooldown_seconds))
+    await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     return {"ok": True}
 
 
