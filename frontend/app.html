@@ -11,7 +11,6 @@
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
-<script src="https://app.adsgalaxy.online/sdk.js/sdk.js?id=5"></script>
 <script src="config.js"></script>
 <style>
 /* ══════════════════════════════════════════════════════════════════
@@ -719,9 +718,32 @@ async function openDirectLinkAd(){
 }
 
 /* ── AdsGalaxy (rewarded ad, front-and-center on the Tasks tab) ────
-   AdsGalaxy has no daily-limit-aware widget of its own — this mirrors
-   the AdsGram rewarded-video card/flow above, just with its own kind
-   ('galaxy') so it has independent settings, limits and analytics. */
+   Per AdsGalaxy's own docs (app.adsgalaxy.online/docs/publisher/miniapps):
+   the Mini App ID belongs in the SDK script's ?id= query param, not in
+   the showAdsGalaxy() call — so the script tag is injected dynamically
+   once we know the admin-configured ID from /api/ads/status, instead of
+   being hardcoded in <head>. showAdsGalaxy() always returns a Promise
+   and takes no arguments. */
+let _galaxySdkPromise = null;
+let _galaxySdkId = null;
+
+function ensureGalaxySDK(miniappId){
+  if (window.showAdsGalaxy && _galaxySdkId === miniappId) return Promise.resolve();
+  if (_galaxySdkPromise && _galaxySdkId === miniappId) return _galaxySdkPromise;
+  _galaxySdkId = miniappId;
+  _galaxySdkPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("adsgalaxy-sdk");
+    if (existing) existing.remove();
+    const s = document.createElement("script");
+    s.id = "adsgalaxy-sdk";
+    s.src = `https://app.adsgalaxy.online/sdk.js/sdk.js?id=${encodeURIComponent(miniappId)}`;
+    s.onload = () => resolve();
+    s.onerror = () => { _galaxySdkPromise = null; reject(new Error("sdk_load_failed")); };
+    document.head.appendChild(s);
+  });
+  return _galaxySdkPromise;
+}
+
 function galaxyAdCardHTML(){
   const g = ADS?.galaxy;
   if (!g || !g.enabled) return "";
@@ -745,7 +767,13 @@ function galaxyAdCardHTML(){
 function startGalaxyCooldownTicker(){
   clearInterval(window._galaxyTick);
   const g = ADS?.galaxy;
-  if (g && g.seconds_left > 0){
+  if (!g || !g.enabled) return;
+
+  // Preload the SDK as soon as the card is visible so the first tap
+  // doesn't have to wait on the script download.
+  ensureGalaxySDK(g.miniapp_id).catch(() => {});
+
+  if (g.seconds_left > 0){
     let left = g.seconds_left;
     const btn = document.getElementById("galaxyAdBtn");
     if (btn){
@@ -771,32 +799,47 @@ async function watchGalaxyAd(){
   if (!g?.enabled){
     return toast("❌ Ads not configured yet");
   }
-  if (typeof window.showAdsGalaxy !== "function"){
-    return toast("❌ Couldn't load ads — try again shortly");
-  }
   const btn = document.getElementById("galaxyAdBtn");
-  api("/api/ads/click", { kind: "galaxy" }).catch(() => {}); // analytics-only, never blocks
   if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
 
   try {
-    // showAdsGalaxy may resolve a promise once the ad finishes, or may
-    // fire-and-forget depending on SDK version — support both.
-    const result = window.showAdsGalaxy({ miniappId: g.miniapp_id });
-    if (result && typeof result.then === "function"){
-      await result;
-    }
+    await ensureGalaxySDK(g.miniapp_id);
+  } catch (e) {
+    toast("❌ Couldn't load ads — try again shortly");
+    if (btn){ btn.disabled = false; btn.textContent = "🌌 Watch Ads"; }
+    return;
+  }
+  if (typeof window.showAdsGalaxy !== "function"){
+    toast("❌ Couldn't load ads — try again shortly");
+    if (btn){ btn.disabled = false; btn.textContent = "🌌 Watch Ads"; }
+    return;
+  }
+
+  api("/api/ads/click", { kind: "galaxy" }).catch(() => {}); // analytics-only, never blocks
+
+  let result;
+  try {
+    // showAdsGalaxy() takes no arguments — the Mini App ID lives only in
+    // the script's ?id= query param above.
+    result = await window.showAdsGalaxy();
   } catch (adErr) {
-    toast("⚠️ Ad not completed — no reward");
+    const code = adErr?.code;
+    const msg = code === "NO_FILL"            ? "⌛ No ads available right now — please try again later"
+              : code === "INVALID_INIT_DATA"  ? "❌ Please open this from inside Telegram"
+              : code === "APP_NOT_READY"      ? "⌛ Ads aren't ready yet — try again in a moment"
+              : "⚠️ Ad not completed — no reward";
+    toast(msg);
     await renderTasks(document.getElementById("view"));
     return;
   }
 
   try {
-    // The ad SDK resolving is not, by itself, trusted for payouts — the
-    // backend re-checks the daily cap and cooldown itself before crediting.
-    const res = await api("/api/ads/galaxy/claim", {});
+    // The resolved promise alone isn't trusted for payouts — the backend
+    // re-checks the daily cap/cooldown, and request_id makes the credit
+    // idempotent so a retry can never pay out twice for the same ad.
+    const res = await api("/api/ads/galaxy/claim", { request_id: result?.request_id || "" });
     tg?.HapticFeedback?.notificationOccurred("success");
-    toast(`✅ +${fmt(res.credited)} Birr credited`);
+    toast(res.already_credited ? "✅ Already credited for this ad" : `✅ +${fmt(res.credited)} Birr credited`);
     if (ME) ME.balance = res.balance;
   } catch (claimErr) {
     const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
