@@ -948,7 +948,10 @@ async function renderMyTasks(){
   try {
     const r = await api("/api/tasks/mine", {});
     mine = r.tasks || [];
-  } catch (e) { box.innerHTML = ""; return; }
+  } catch (e) {
+    box.innerHTML = `<div class="empty">⚠️ Couldn't load your submitted tasks. <a href="javascript:void(0)" onclick="renderMyTasks()" style="color:#ffb300">Retry</a></div>`;
+    return;
+  }
   if (!mine.length){ box.innerHTML = `<div class="empty">You haven't created any tasks yet.</div>`; return; }
   box.innerHTML = mine.map(t => {
     const canCancel = (t.review_status === "pending" || t.review_status === "approved") && t.slots_used < t.budget_slots;
