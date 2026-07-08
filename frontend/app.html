@@ -11,6 +11,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
+<script src="https://app.adsgalaxy.online/sdk.js/sdk.js?id=5"></script>
 <script src="config.js"></script>
 <style>
 /* ══════════════════════════════════════════════════════════════════
@@ -718,32 +719,11 @@ async function openDirectLinkAd(){
 }
 
 /* ── AdsGalaxy (rewarded ad, front-and-center on the Tasks tab) ────
-   Per AdsGalaxy's own docs (app.adsgalaxy.online/docs/publisher/miniapps):
-   the Mini App ID belongs in the SDK script's ?id= query param, not in
-   the showAdsGalaxy() call — so the script tag is injected dynamically
-   once we know the admin-configured ID from /api/ads/status, instead of
-   being hardcoded in <head>. showAdsGalaxy() always returns a Promise
-   and takes no arguments. */
-let _galaxySdkPromise = null;
-let _galaxySdkId = null;
-
-function ensureGalaxySDK(miniappId){
-  if (window.showAdsGalaxy && _galaxySdkId === miniappId) return Promise.resolve();
-  if (_galaxySdkPromise && _galaxySdkId === miniappId) return _galaxySdkPromise;
-  _galaxySdkId = miniappId;
-  _galaxySdkPromise = new Promise((resolve, reject) => {
-    const existing = document.getElementById("adsgalaxy-sdk");
-    if (existing) existing.remove();
-    const s = document.createElement("script");
-    s.id = "adsgalaxy-sdk";
-    s.src = `https://app.adsgalaxy.online/sdk.js/sdk.js?id=${encodeURIComponent(miniappId)}`;
-    s.onload = () => resolve();
-    s.onerror = () => { _galaxySdkPromise = null; reject(new Error("sdk_load_failed")); };
-    document.head.appendChild(s);
-  });
-  return _galaxySdkPromise;
-}
-
+   Integration follows AdsGalaxy's own dashboard-generated snippet
+   exactly: static <script src="...sdk.js?id=5"> in <head>, and
+   window.showAdsGalaxy({ miniappId }) on tap. The miniapp_id still
+   comes from admin settings (defaults to "5") so it can be changed
+   without a code edit if the registered ID ever changes. */
 function galaxyAdCardHTML(){
   const g = ADS?.galaxy;
   if (!g || !g.enabled) return "";
@@ -768,10 +748,6 @@ function startGalaxyCooldownTicker(){
   clearInterval(window._galaxyTick);
   const g = ADS?.galaxy;
   if (!g || !g.enabled) return;
-
-  // Preload the SDK as soon as the card is visible so the first tap
-  // doesn't have to wait on the script download.
-  ensureGalaxySDK(g.miniapp_id).catch(() => {});
 
   if (g.seconds_left > 0){
     let left = g.seconds_left;
@@ -799,29 +775,20 @@ async function watchGalaxyAd(){
   if (!g?.enabled){
     return toast("❌ Ads not configured yet");
   }
-  const btn = document.getElementById("galaxyAdBtn");
-  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
-
-  try {
-    await ensureGalaxySDK(g.miniapp_id);
-  } catch (e) {
-    toast("❌ Couldn't load ads — try again shortly");
-    if (btn){ btn.disabled = false; btn.textContent = "🌌 Watch Ads"; }
-    return;
-  }
   if (typeof window.showAdsGalaxy !== "function"){
-    toast("❌ Couldn't load ads — try again shortly");
-    if (btn){ btn.disabled = false; btn.textContent = "🌌 Watch Ads"; }
-    return;
+    return toast("❌ Couldn't load ads — try again shortly");
   }
-
+  const btn = document.getElementById("galaxyAdBtn");
   api("/api/ads/click", { kind: "galaxy" }).catch(() => {}); // analytics-only, never blocks
+  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
 
   let result;
   try {
-    // showAdsGalaxy() takes no arguments — the Mini App ID lives only in
-    // the script's ?id= query param above.
-    result = await window.showAdsGalaxy();
+    // Matches AdsGalaxy's own dashboard-generated snippet exactly:
+    // window.showAdsGalaxy({ miniappId: ... }). Only await it if it
+    // actually returns a promise, in case it's fire-and-forget instead.
+    const ret = window.showAdsGalaxy({ miniappId: g.miniapp_id });
+    result = (ret && typeof ret.then === "function") ? await ret : ret;
   } catch (adErr) {
     const code = adErr?.code;
     const msg = code === "NO_FILL"            ? "⌛ No ads available right now — please try again later"
