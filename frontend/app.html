@@ -11,6 +11,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
+<script src="https://app.adsgalaxy.online/sdk.js/sdk.js?id=5"></script>
 <script src="config.js"></script>
 <style>
 /* ══════════════════════════════════════════════════════════════════
@@ -717,6 +718,95 @@ async function openDirectLinkAd(){
   }, 1000);
 }
 
+/* ── AdsGalaxy (rewarded ad, front-and-center on the Tasks tab) ────
+   AdsGalaxy has no daily-limit-aware widget of its own — this mirrors
+   the AdsGram rewarded-video card/flow above, just with its own kind
+   ('galaxy') so it has independent settings, limits and analytics. */
+function galaxyAdCardHTML(){
+  const g = ADS?.galaxy;
+  if (!g || !g.enabled) return "";
+  const capped = g.watched_today >= g.daily_limit;
+  return `
+    <div class="card" id="galaxyAdCard" style="border-color:rgba(200,242,77,.18);margin-bottom:14px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
+        <div>
+          <div style="font-weight:700;font-size:.86rem">🌌 Watch Ads</div>
+          <div class="mini" style="margin-top:2px">Earn ${fmt(g.reward_amount)} Birr per view</div>
+        </div>
+        <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">${g.watched_today}/${g.daily_limit}</div>
+      </div>
+      <button class="btn gold" id="galaxyAdBtn" onclick="watchGalaxyAd()" ${capped ? "disabled" : ""}>
+        ${capped ? "✅ Daily Limit Reached" : "🌌 Watch Ads"}
+      </button>
+    </div>
+  `;
+}
+
+function startGalaxyCooldownTicker(){
+  clearInterval(window._galaxyTick);
+  const g = ADS?.galaxy;
+  if (g && g.seconds_left > 0){
+    let left = g.seconds_left;
+    const btn = document.getElementById("galaxyAdBtn");
+    if (btn){
+      btn.disabled = true;
+      const label = () => `⏳ Wait ${left}s`;
+      btn.textContent = label();
+      window._galaxyTick = setInterval(() => {
+        left -= 1;
+        if (left <= 0){
+          clearInterval(window._galaxyTick);
+          btn.disabled = false;
+          btn.textContent = "🌌 Watch Ads";
+        } else {
+          btn.textContent = label();
+        }
+      }, 1000);
+    }
+  }
+}
+
+async function watchGalaxyAd(){
+  const g = ADS?.galaxy;
+  if (!g?.enabled){
+    return toast("❌ Ads not configured yet");
+  }
+  if (typeof window.showAdsGalaxy !== "function"){
+    return toast("❌ Couldn't load ads — try again shortly");
+  }
+  const btn = document.getElementById("galaxyAdBtn");
+  api("/api/ads/click", { kind: "galaxy" }).catch(() => {}); // analytics-only, never blocks
+  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
+
+  try {
+    // showAdsGalaxy may resolve a promise once the ad finishes, or may
+    // fire-and-forget depending on SDK version — support both.
+    const result = window.showAdsGalaxy({ miniappId: g.miniapp_id });
+    if (result && typeof result.then === "function"){
+      await result;
+    }
+  } catch (adErr) {
+    toast("⚠️ Ad not completed — no reward");
+    await renderTasks(document.getElementById("view"));
+    return;
+  }
+
+  try {
+    // The ad SDK resolving is not, by itself, trusted for payouts — the
+    // backend re-checks the daily cap and cooldown itself before crediting.
+    const res = await api("/api/ads/galaxy/claim", {});
+    tg?.HapticFeedback?.notificationOccurred("success");
+    toast(`✅ +${fmt(res.credited)} Birr credited`);
+    if (ME) ME.balance = res.balance;
+  } catch (claimErr) {
+    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
+              : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
+              : "❌ Couldn't credit the reward — try again";
+    toast(msg);
+  }
+  await renderTasks(document.getElementById("view"));
+}
+
 /* ══════════════════════════════════════════════════════════════════
    TASKS
    ══════════════════════════════════════════════════════════════════ */
@@ -724,8 +814,10 @@ let taskTimer = null;
 
 async function renderTasks(view){
   const [data] = await Promise.all([api("/api/tasks"), loadGateStatus().catch(() => null)]);
+  ADS = await api("/api/ads/status").catch(() => ADS);
   clearInterval(taskTimer);
 
+  const galaxyHTML = galaxyAdCardHTML();
   const showFakeSection = !ME?.is_admin && GATE.fake_channels?.length && !GATE.fake_seen;
   const fakeSectionHTML = showFakeSection ? `
     <h2 class="sect" style="margin-top:0">Recommended Channels</h2>
@@ -741,11 +833,13 @@ async function renderTasks(view){
   ` : "";
 
   if (!data.tasks.length){
-    view.innerHTML = fakeSectionHTML + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    view.innerHTML = galaxyHTML + fakeSectionHTML + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    startGalaxyCooldownTicker();
     return;
   }
 
-  view.innerHTML = fakeSectionHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
+  view.innerHTML = galaxyHTML + fakeSectionHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
+  startGalaxyCooldownTicker();
   const list = document.getElementById("taskList");
 
   // Server only tells us "claimable" once the wait timer is done — we then
@@ -1374,6 +1468,27 @@ async function adminSettings(body){
       <input id="stAdDlCooldown" type="number" value="${s.direct_link_cooldown_seconds}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+      <h2 class="sect" style="margin:0">AdsGalaxy (Watch Ads)</h2>
+      <button class="btn sm ghost" style="margin-top:14px" onclick="checkGalaxyConnection()">🔍 Check Connection</button>
+    </div>
+    <div id="galaxyCheckResult"></div>
+    <div class="card">
+      <label class="f">Enable AdsGalaxy</label>
+      <select id="stGalaxyEnabled">
+        <option value="0" ${!s.galaxy_ads_enabled ? "selected" : ""}>Disabled</option>
+        <option value="1" ${s.galaxy_ads_enabled ? "selected" : ""}>Enabled</option>
+      </select>
+      <label class="f">AdsGalaxy Mini App ID</label>
+      <input id="stGalaxyMiniappId" type="text" placeholder="e.g. 5" value="${escapeHtml(s.adsgalaxy_miniapp_id || '')}">
+      <label class="f">Reward per Ad (Birr)</label>
+      <input id="stGalaxyReward" type="number" step="0.1" value="${s.galaxy_reward_amount}">
+      <label class="f">Daily Limit per User</label>
+      <input id="stGalaxyDaily" type="number" value="${s.galaxy_daily_limit}">
+      <label class="f">Cooldown Between Ads (seconds)</label>
+      <input id="stGalaxyCooldown" type="number" value="${s.galaxy_cooldown_seconds}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
 async function saveSettings(){
@@ -1390,11 +1505,18 @@ async function saveSettings(){
   const direct_link_daily_limit = parseInt(document.getElementById("stAdDlDaily").value, 10);
   const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
   const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
+  const galaxy_ads_enabled = document.getElementById("stGalaxyEnabled").value === "1";
+  const adsgalaxy_miniapp_id = document.getElementById("stGalaxyMiniappId").value.trim();
+  const galaxy_reward_amount = parseFloat(document.getElementById("stGalaxyReward").value);
+  const galaxy_daily_limit = parseInt(document.getElementById("stGalaxyDaily").value, 10);
+  const galaxy_cooldown_seconds = parseInt(document.getElementById("stGalaxyCooldown").value, 10);
   await api("/api/admin/settings/update", {
     reward_per_referral, min_withdrawal, support_username,
     ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
     adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
     direct_link_wait_seconds, direct_link_cooldown_seconds,
+    galaxy_ads_enabled, adsgalaxy_miniapp_id, galaxy_reward_amount,
+    galaxy_daily_limit, galaxy_cooldown_seconds,
   });
   toast("✅ Settings saved");
   refreshMe();
@@ -1418,6 +1540,28 @@ async function checkAdsgramConnection(){
         <div style="margin-top:8px;font-weight:700;font-size:.82rem">
           ${r.video_ready ? "✅ Rewarded video is live" : "⚠️ Rewarded video not fully configured"}<br>
           ${r.direct_link_ready ? "✅ Direct Link is live" : "⚠️ Direct Link not fully configured"}
+        </div>
+      </div>`;
+  } catch (e){
+    box.innerHTML = `<div class="empty">Couldn't run the check.</div>`;
+  }
+}
+async function checkGalaxyConnection(){
+  const box = document.getElementById("galaxyCheckResult");
+  box.innerHTML = `<div class="mini" style="padding:8px 2px">Checking…</div>`;
+  try {
+    const r = await api("/api/admin/ads/verify");
+    const row = (ok, label) => `
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
+        <span>${ok ? "✅" : "❌"}</span><span class="mini">${label}</span>
+      </div>`;
+    box.innerHTML = `
+      <div class="card" style="padding:12px 14px;">
+        ${row(r.galaxy_sdk_script_present, "AdsGalaxy SDK script loaded in Mini App")}
+        ${row(r.galaxy_enabled, "AdsGalaxy enabled in settings")}
+        ${row(r.galaxy_miniapp_id_configured, "Mini App ID configured")}
+        <div style="margin-top:8px;font-weight:700;font-size:.82rem">
+          ${r.galaxy_ready ? "✅ Watch Ads is live" : "⚠️ Watch Ads not fully configured"}
         </div>
       </div>`;
   } catch (e){
