@@ -346,6 +346,12 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
     "ALTER TABLE users         ADD COLUMN last_verify_msg_id INTEGER DEFAULT 0",
     "ALTER TABLE users         ADD COLUMN last_seen TEXT DEFAULT ''",
+    # AdsGalaxy returns a request_id per ad view — stored here so a claim
+    # can never be credited twice for the same ad (see reward security
+    # note in the AdsGalaxy docs: browser promises alone aren't proof).
+    "ALTER TABLE ad_events     ADD COLUMN external_ref TEXT DEFAULT ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_events_external_ref "
+    "ON ad_events(kind, external_ref) WHERE external_ref != ''",
     """CREATE TABLE IF NOT EXISTS fraud_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, reason TEXT, ip_address TEXT,
@@ -731,6 +737,28 @@ class DataEngine:
                 "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
                 "VALUES (?, ?, 'completed', ?, datetime('now'))",
                 (user_id, kind, reward),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_ad_event_by_ref(kind: str, external_ref: str):
+        """Look up a prior AdsGalaxy claim by its request_id so a repeated
+        claim call (retry, double-tap, replay) never credits twice."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM ad_events WHERE kind=? AND external_ref=? LIMIT 1",
+                (kind, external_ref),
+            )
+            return await cur.fetchone()
+
+    @staticmethod
+    async def record_ad_event_with_ref(user_id: int, kind: str, reward: float, external_ref: str):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status, reward, completed_at, external_ref) "
+                "VALUES (?, ?, 'completed', ?, datetime('now'), ?)",
+                (user_id, kind, reward, external_ref),
             )
             await db.commit()
 
@@ -2872,12 +2900,18 @@ async def api_ads_claim(body: ApiBase):
     return {"credited": reward_amount}
 
 
+class AdGalaxyClaimRequest(ApiBase):
+    request_id: str = ""
+
+
 @api_app.post("/api/ads/galaxy/claim")
-async def api_ads_galaxy_claim(body: ApiBase):
-    """AdsGalaxy rewarded ad — same trust model as the AdsGram rewarded
-    video claim above: the frontend only calls this after the AdsGalaxy
-    SDK call resolves, and we re-check the daily cap / cooldown here
-    server-side before paying anything out."""
+async def api_ads_galaxy_claim(body: AdGalaxyClaimRequest):
+    """AdsGalaxy rewarded ad — the frontend only calls this after
+    window.showAdsGalaxy() resolves. Per AdsGalaxy's reward-security
+    guidance, the resolved promise alone isn't proof of anything the
+    backend should trust blindly: we still re-check the daily cap and
+    cooldown here, and we key off the SDK's request_id so a retried or
+    duplicated claim call can never credit the same ad view twice."""
     user = await _authenticate(body)
     uid = user["user_id"]
 
@@ -2885,6 +2919,15 @@ async def api_ads_galaxy_claim(body: ApiBase):
     miniapp_id = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "").strip()
     if not galaxy_enabled or not miniapp_id:
         raise HTTPException(status_code=400, detail="ads_disabled")
+
+    request_id = (body.request_id or "").strip()
+    if request_id:
+        existing = await DataEngine.get_ad_event_by_ref(AD_KIND_GALAXY, request_id)
+        if existing:
+            # Already credited for this exact ad view — respond success
+            # without crediting again (safe to retry/replay this call).
+            fresh = await DataEngine.get_user(uid)
+            return {"credited": 0, "already_credited": True, "balance": float(fresh["balance"])}
 
     daily_limit      = int(await DataEngine.get_setting("galaxy_daily_limit", "10"))
     cooldown_seconds = int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30"))
@@ -2905,7 +2948,17 @@ async def api_ads_galaxy_claim(body: ApiBase):
         except Exception:
             pass
 
-    await DataEngine.record_ad_event(uid, AD_KIND_GALAXY, reward_amount)
+    try:
+        if request_id:
+            await DataEngine.record_ad_event_with_ref(uid, AD_KIND_GALAXY, reward_amount, request_id)
+        else:
+            await DataEngine.record_ad_event(uid, AD_KIND_GALAXY, reward_amount)
+    except Exception:
+        # Unique (kind, external_ref) constraint tripped — a concurrent
+        # request already recorded this exact ad view. Don't double-pay.
+        fresh = await DataEngine.get_user(uid)
+        return {"credited": 0, "already_credited": True, "balance": float(fresh["balance"])}
+
     await DataEngine.add_balance(uid, reward_amount)
     fresh = await DataEngine.get_user(uid)
     return {"credited": reward_amount, "balance": float(fresh["balance"])}
