@@ -280,6 +280,15 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
   animation:fabPulse 2.4s ease-in-out infinite;
 }
 .support-fab:active{transform:scale(.93);}
+
+/* ── Small inline "+" button next to the Tasks header ────── */
+.add-task-btn{
+  width:32px;height:32px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;
+  background:linear-gradient(135deg,#ffcf4d,#ffb300);color:#0a0d05;font-size:1.15rem;font-weight:700;
+  display:flex;align-items:center;justify-content:center;line-height:1;
+  box-shadow:0 4px 12px rgba(255,179,0,.35);
+}
+.add-task-btn:active{transform:scale(.9);}
 @keyframes fabPulse{
   0%,100%{box-shadow:0 8px 22px rgba(47,141,250,.45);}
   50%{box-shadow:0 8px 26px rgba(47,141,250,.75);}
@@ -793,22 +802,26 @@ async function renderTasks(view){
     </div>
   ` : "";
 
-  const createTaskHTML = (UTC?.enabled) ? `
-    <div class="card" id="createTaskCard" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
-      <div style="font-weight:700">📢 Promote your own channel</div>
-      <div class="mini">Pay from your balance to have other users join your channel as a task.</div>
-      <button class="btn ghost" id="createTaskToggle" onclick="openCreateTask()">➕ Create Task</button>
-      <div id="createTaskForm" style="display:none;flex-direction:column;gap:8px;margin-top:4px;"></div>
-    </div>
-  ` : "";
+  const addTaskBtnHTML = (UTC?.enabled)
+    ? `<button class="add-task-btn" onclick="openCreateTaskPage()" title="Create Task">+</button>` : "";
 
   if (!data.tasks.length){
-    view.innerHTML = fakeSectionHTML + createTaskHTML + myTasksHTML() + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    view.innerHTML = fakeSectionHTML
+      + `<div style="display:flex;justify-content:space-between;align-items:center;">
+           <h2 class="sect" style="margin:0">Tasks</h2>${addTaskBtnHTML}
+         </div>
+         <div class="empty">📭 No tasks right now. Check back later!</div>`
+      + myTasksHTML();
     await renderMyTasks();
     return;
   }
 
-  view.innerHTML = fakeSectionHTML + createTaskHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>` + myTasksHTML();
+  view.innerHTML = fakeSectionHTML
+    + `<div style="display:flex;justify-content:space-between;align-items:center;">
+         <h2 class="sect" style="margin:0">Tasks — Join & Earn</h2>${addTaskBtnHTML}
+       </div>
+       <div id="taskList" class="cascade"></div>`
+    + myTasksHTML();
   await renderMyTasks();
   const list = document.getElementById("taskList");
 
@@ -953,45 +966,75 @@ async function renderMyTasks(){
   }).join("");
 }
 
-function openCreateTask(){
-  const wrap = document.getElementById("createTaskForm");
-  const toggleBtn = document.getElementById("createTaskToggle");
-  if (!wrap) return;
-  if (wrap.style.display !== "none"){ wrap.style.display = "none"; return; }
-  toggleBtn.style.display = "none";
-  wrap.style.display = "flex";
+function openCreateTaskPage(){
+  const view = document.getElementById("view");
+  view.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <button class="add-task-btn" style="background:#242424;box-shadow:none;color:#fff;font-size:1.3rem;"
+        onclick="renderTasks(document.getElementById('view'))">‹</button>
+      <h2 class="sect" style="margin:0">Create Task</h2>
+    </div>
+    <div class="card" id="createTaskForm" style="display:flex;flex-direction:column;gap:8px;"></div>
+  `;
   renderCtStep1();
 }
 
-// verified channel_id carried from step 1 into step 2 (empty = unverified/"fake")
+// Carried from step 1 into step 2/submit. Empty channel = unverified/"fake".
 let _ctVerifiedChannel = "";
+let _ctInviteLink = "";
+
+// Accepts @username, a bare username, or a https://t.me/... link and
+// figures out the public username (if any) plus a clean invite link.
+// Private invite-only links (t.me/+xxx, t.me/joinchat/xxx) have no
+// derivable username, so they can't be auto-verified.
+function parseChannelInput(raw){
+  raw = (raw || "").trim();
+  if (!raw) return null;
+  if (/t\.me\/(\+|joinchat\/)/i.test(raw)){
+    const link = raw.startsWith("http") ? raw : `https://${raw.replace(/^@/, "")}`;
+    return { username: null, chatId: null, inviteLink: link, isPrivate: true };
+  }
+  let username = null;
+  const linkMatch = raw.match(/t\.me\/@?([A-Za-z0-9_]{4,32})/i);
+  if (linkMatch) username = linkMatch[1];
+  else if (raw.startsWith("@")) username = raw.slice(1);
+  else if (/^[A-Za-z0-9_]{4,32}$/.test(raw)) username = raw;
+  if (!username) return { username: null, chatId: null, inviteLink: raw, isPrivate: false };
+  return { username, chatId: `@${username}`, inviteLink: `https://t.me/${username}`, isPrivate: false };
+}
 
 function renderCtStep1(){
   const wrap = document.getElementById("createTaskForm");
   const botTag = UTC.bot_username ? `@${escapeHtml(UTC.bot_username)}` : "the bot";
   wrap.innerHTML = `
     <div class="mini">
-      To let us verify people actually joined, first add ${botTag} as an
-      <b>Admin</b> in your channel. Then enter your Channel ID/username below and tap Check.
+      To let us verify people actually joined, add ${botTag} as an <b>Admin</b>
+      in your channel. Then enter your channel's username or link below —
+      just like joining it yourself, no ID needed.
     </div>
-    <label class="f">Channel ID or @username</label>
-    <input id="ctChannelId" placeholder="@yourchannel or -1001234567890">
+    <label class="f">Channel Username or Link</label>
+    <input id="ctChannel" placeholder="@yourchannel or https://t.me/yourchannel">
     <button class="btn gold" id="ctCheckBtn" onclick="checkCtAdmin()">🔄 I've Added the Bot — Check</button>
     <button class="btn ghost" onclick="skipCtVerify()">Skip verification (unverified task)</button>
   `;
 }
 
 async function checkCtAdmin(){
-  const channel_id = document.getElementById("ctChannelId").value.trim();
-  if (!channel_id) return toast("❌ Enter your channel ID or @username first");
+  const raw = document.getElementById("ctChannel").value.trim();
+  const parsed = parseChannelInput(raw);
+  if (!parsed) return toast("❌ Enter your channel username or link first");
+  if (parsed.isPrivate || !parsed.chatId){
+    return toast("⚠️ Can't auto-verify a private invite link — use 'Skip verification' below");
+  }
   const btn = document.getElementById("ctCheckBtn");
   btn.disabled = true;
   btn.innerHTML = `<span class="spin-ico"></span> Checking…`;
   try {
-    const r = await api("/api/tasks/verify_admin", { channel_id });
+    const r = await api("/api/tasks/verify_admin", { channel_id: parsed.chatId });
     if (r.is_admin){
       tg?.HapticFeedback?.notificationOccurred("success");
-      _ctVerifiedChannel = channel_id;
+      _ctVerifiedChannel = parsed.chatId;
+      _ctInviteLink = parsed.inviteLink;
       renderCtStep2(true);
     } else {
       toast("❌ Bot isn't an admin there yet — add it, then tap Check again");
@@ -1006,7 +1049,11 @@ async function checkCtAdmin(){
 }
 
 function skipCtVerify(){
+  const raw = document.getElementById("ctChannel").value.trim();
+  const parsed = parseChannelInput(raw);
+  if (!parsed || !parsed.inviteLink) return toast("❌ Enter your channel username or link first");
   _ctVerifiedChannel = "";
+  _ctInviteLink = parsed.inviteLink;
   renderCtStep2(false);
 }
 
@@ -1019,8 +1066,6 @@ function renderCtStep2(verified){
     </div>
     <label class="f">Channel Title</label>
     <input id="ctTitle" placeholder="e.g. My News Channel">
-    <label class="f">Invite Link</label>
-    <input id="ctLink" placeholder="https://t.me/yourchannel">
     <label class="f">Reward per Person (Birr, ${UTC.min_reward}–${UTC.max_reward})</label>
     <input id="ctReward" type="number" step="0.1" min="${UTC.min_reward}" max="${UTC.max_reward}" oninput="updateCtCost()">
     <label class="f">Number of People (${UTC.min_slots}–${UTC.max_slots})</label>
@@ -1039,17 +1084,18 @@ function updateCtCost(){
 
 async function submitCreateTask(){
   const title = document.getElementById("ctTitle").value.trim();
-  const invite_link = document.getElementById("ctLink").value.trim();
   const reward = parseFloat(document.getElementById("ctReward").value);
   const budget_slots = parseInt(document.getElementById("ctSlots").value, 10);
-  if (!title || !invite_link || !reward || !budget_slots){
+  if (!title || !_ctInviteLink || !reward || !budget_slots){
     return toast("❌ Please fill in every field");
   }
   const btn = document.getElementById("ctSubmitBtn");
   btn.disabled = true;
   btn.innerHTML = `<span class="spin-ico"></span> Submitting…`;
   try {
-    await api("/api/tasks/create", { title, invite_link, reward, budget_slots, channel_id: _ctVerifiedChannel });
+    await api("/api/tasks/create", {
+      title, invite_link: _ctInviteLink, reward, budget_slots, channel_id: _ctVerifiedChannel,
+    });
     tg?.HapticFeedback?.notificationOccurred("success");
     toast("✅ Submitted — waiting for admin approval");
     await renderTasks(document.getElementById("view"));
@@ -1057,7 +1103,7 @@ async function submitCreateTask(){
     const msg = e.message === "insufficient_balance" ? "❌ Not enough balance"
               : e.message === "reward_out_of_range" ? `❌ Reward must be ${UTC.min_reward}-${UTC.max_reward} Birr`
               : e.message === "slots_out_of_range"  ? `❌ Number of people must be ${UTC.min_slots}-${UTC.max_slots}`
-              : e.message === "invalid_link"        ? "❌ Please use a valid t.me invite link"
+              : e.message === "invalid_link"        ? "❌ Please use a valid t.me channel"
               : "❌ Couldn't submit — try again";
     toast(msg);
     btn.disabled = false;
