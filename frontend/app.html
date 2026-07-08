@@ -36,7 +36,7 @@
 html,body{height:100%}
 body{
   background:var(--bg);color:var(--ink);font-family:'Inter',system-ui,-apple-system,sans-serif;
-  -webkit-font-smoothing:antialiased;padding-bottom:92px;min-height:100%;
+  -webkit-font-smoothing:antialiased;padding-bottom:calc(120px + env(safe-area-inset-bottom));min-height:100%;
 }
 body::before{
   content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
