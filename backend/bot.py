@@ -2803,6 +2803,56 @@ async def api_me(body: ApiBase):
     }
 
 
+# ── /api/invite/share_card — sends the user a ready-to-forward invite
+#    message (bot's photo + a written invite caption + an inline button
+#    holding their referral link) in their own chat with the bot, so they
+#    can just long-press → Forward it straight to friends. ────────────────
+_bot_photo_file_id: str | None = None  # cached after first lookup
+
+
+async def _get_bot_photo_file_id() -> str | None:
+    global _bot_photo_file_id
+    if _bot_photo_file_id:
+        return _bot_photo_file_id
+    try:
+        photos = await bot.get_user_profile_photos(BOT_ID or (await bot.get_me()).id, limit=1)
+        if photos.total_count > 0:
+            _bot_photo_file_id = photos.photos[0][-1].file_id  # largest size
+    except Exception:
+        pass
+    return _bot_photo_file_id
+
+
+@api_app.post("/api/invite/share_card")
+async def api_invite_share_card(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    uname = BOT_USERNAME or (await bot.get_me()).username
+    referral_link = f"https://t.me/{uname}?start={uid}"
+
+    caption = (
+        "🎉 <b>I'm earning real money with this bot — and you can too!</b>\n\n"
+        "✅ Complete simple tasks\n"
+        "✅ Watch short ads\n"
+        "✅ Invite friends for bonus rewards\n"
+        "✅ Withdraw straight to Telebirr\n\n"
+        "Tap the button below to join — it only takes a minute 👇"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Join & Start Earning", url=referral_link)],
+    ])
+
+    photo_id = await _get_bot_photo_file_id()
+    try:
+        if photo_id:
+            await bot.send_photo(chat_id=uid, photo=photo_id, caption=caption, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=uid, text=caption, reply_markup=kb)
+    except Exception:
+        raise HTTPException(status_code=503, detail="send_failed")
+    return {"ok": True}
+
+
 # ── /api/gate/* — force-join gate ────────────────────────────────────────
 @api_app.post("/api/gate/status")
 async def api_gate_status(body: ApiBase):
