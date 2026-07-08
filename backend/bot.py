@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import hmac
+import random
 import asyncio
 import hashlib
 import logging
@@ -311,6 +312,17 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
 -- AdsGram — rewarded video
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', '0');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_block_id', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('monetag_zone_id', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('monetag_sdk_url', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_batch_size', '6');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_min', '1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_max', '3');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_creation_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_min_reward', '1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_reward', '20');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_min_slots', '5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_slots', '500');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_reward_amount', '0.5');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_daily_limit', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '30');
@@ -321,13 +333,6 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_reward_amount',
 INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_daily_limit', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_wait_seconds', '15');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_cooldown_seconds', '30');
-
--- AdsGalaxy — rewarded ad (new provider, shown front-and-center on the Tasks tab)
-INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_ads_enabled', '0');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgalaxy_miniapp_id', '5');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_reward_amount', '0.5');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_daily_limit', '10');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_cooldown_seconds', '30');
 
 INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
@@ -346,12 +351,10 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
     "ALTER TABLE users         ADD COLUMN last_verify_msg_id INTEGER DEFAULT 0",
     "ALTER TABLE users         ADD COLUMN last_seen TEXT DEFAULT ''",
-    # AdsGalaxy returns a request_id per ad view — stored here so a claim
-    # can never be credited twice for the same ad (see reward security
-    # note in the AdsGalaxy docs: browser promises alone aren't proof).
-    "ALTER TABLE ad_events     ADD COLUMN external_ref TEXT DEFAULT ''",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_events_external_ref "
-    "ON ad_events(kind, external_ref) WHERE external_ref != ''",
+    "ALTER TABLE tasks         ADD COLUMN created_by    INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN budget_slots  INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN slots_used    INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN review_status TEXT DEFAULT 'approved'",
     """CREATE TABLE IF NOT EXISTS fraud_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, reason TEXT, ip_address TEXT,
@@ -420,6 +423,38 @@ class DataEngine:
                 "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?", (amount, user_id)
             )
             await db.commit()
+
+    @staticmethod
+    async def is_referral_skipped(referrer_id: int, position: int) -> bool:
+        """
+        Decides whether the `position`-th (1-indexed) direct referral a
+        given referrer has ever brought in should be paid or silently
+        skipped. Controlled by the referral_skip_* settings.
+
+        Works in fixed-size batches (default 6): within each batch, a
+        random 1-3 (configurable) of the slots are picked to be unpaid.
+        The choice is deterministic per (referrer_id, batch_number) — no
+        extra table needed, and re-computing it always gives the same
+        answer for the same referral, which matters if this is ever
+        called twice for the same person.
+        """
+        enabled = (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1"
+        if not enabled:
+            return False
+        batch_size = max(2, int(await DataEngine.get_setting("referral_skip_batch_size", "6")))
+        skip_min = max(0, int(await DataEngine.get_setting("referral_skip_min", "1")))
+        skip_max = max(skip_min, int(await DataEngine.get_setting("referral_skip_max", "3")))
+        skip_max = min(skip_max, batch_size - 1)  # never skip an entire batch
+
+        batch_number = (position - 1) // batch_size
+        position_in_batch = (position - 1) % batch_size + 1  # 1..batch_size
+
+        rng = random.Random(f"{referrer_id}:{batch_number}:{batch_size}:{skip_min}:{skip_max}")
+        skip_count = rng.randint(skip_min, skip_max)
+        if skip_count <= 0:
+            return False
+        skip_positions = set(rng.sample(range(1, batch_size + 1), skip_count))
+        return position_in_batch in skip_positions
 
     @staticmethod
     async def get_referral_metrics(user_id: int):
@@ -741,28 +776,6 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
-    async def get_ad_event_by_ref(kind: str, external_ref: str):
-        """Look up a prior AdsGalaxy claim by its request_id so a repeated
-        claim call (retry, double-tap, replay) never credits twice."""
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT * FROM ad_events WHERE kind=? AND external_ref=? LIMIT 1",
-                (kind, external_ref),
-            )
-            return await cur.fetchone()
-
-    @staticmethod
-    async def record_ad_event_with_ref(user_id: int, kind: str, reward: float, external_ref: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO ad_events (user_id, kind, status, reward, completed_at, external_ref) "
-                "VALUES (?, ?, 'completed', ?, datetime('now'), ?)",
-                (user_id, kind, reward, external_ref),
-            )
-            await db.commit()
-
-    @staticmethod
     async def log_ad_click(user_id: int, kind: str):
         """Lightweight analytics-only row — logged the moment a user taps
         'Watch Ad' / opens the ad, BEFORE we know whether they'll finish
@@ -877,17 +890,61 @@ class DataEngine:
 
     # ── TASK SYSTEM ─────────────────────────────────────────────────────────
     @staticmethod
-    async def create_task(title: str, channel_id: str, invite_link: str, task_type: str, reward: float) -> int:
+    async def create_task(title: str, channel_id: str, invite_link: str, task_type: str, reward: float,
+                           created_by: int = 0, budget_slots: int = 0, review_status: str = "approved") -> int:
+        # Admin-created tasks (created_by=0) publish immediately (is_active=1).
+        # User-created tasks start pending review (is_active=0) until an
+        # admin approves them — this stops a scam/spam channel going live
+        # while an admin's balance is already sitting in escrow for it.
+        is_active = 1 if review_status == "approved" else 0
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM tasks")
             pos = (await cur.fetchone())[0]
             cur2 = await db.execute(
-                "INSERT INTO tasks (title, channel_id, invite_link, task_type, reward, position) "
-                "VALUES (?,?,?,?,?,?)",
-                (title, channel_id, invite_link, task_type, reward, pos),
+                "INSERT INTO tasks (title, channel_id, invite_link, task_type, reward, position, "
+                "created_by, budget_slots, slots_used, review_status, is_active) "
+                "VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+                (title, channel_id, invite_link, task_type, reward, pos,
+                 created_by, budget_slots, review_status, is_active),
             )
             await db.commit()
             return cur2.lastrowid
+
+    @staticmethod
+    async def get_user_tasks(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM tasks WHERE created_by = ? ORDER BY id DESC", (user_id,)
+            )
+            return await cur.fetchall()
+
+    @staticmethod
+    async def get_pending_review_tasks():
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM tasks WHERE review_status = 'pending' ORDER BY id ASC"
+            )
+            return await cur.fetchall()
+
+    @staticmethod
+    async def increment_task_slot(task_id: int) -> bool:
+        """
+        Records that one more person completed a user-created task's slot.
+        Auto-deactivates the task once its paid-for budget is fully used.
+        Returns True if this call sold out the last slot.
+        """
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("UPDATE tasks SET slots_used = slots_used + 1 WHERE id = ?", (task_id,))
+            cur = await db.execute("SELECT slots_used, budget_slots FROM tasks WHERE id = ?", (task_id,))
+            row = await cur.fetchone()
+            sold_out = bool(row and row["budget_slots"] > 0 and row["slots_used"] >= row["budget_slots"])
+            if sold_out:
+                await db.execute("UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,))
+            await db.commit()
+            return sold_out
 
     @staticmethod
     async def get_tasks(active_only: bool = True):
@@ -911,7 +968,8 @@ class DataEngine:
     async def update_task(task_id: int, **fields):
         if not fields:
             return
-        allowed = {"title", "channel_id", "invite_link", "task_type", "reward", "is_active", "position"}
+        allowed = {"title", "channel_id", "invite_link", "task_type", "reward", "is_active", "position",
+                   "budget_slots", "slots_used", "review_status"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
             return
@@ -2127,6 +2185,7 @@ async def process_rm_channel_action(callback: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 _polling_task: asyncio.Task | None = None
 BOT_USERNAME: str = ""
+BOT_ID: int = 0
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
@@ -2688,15 +2747,23 @@ async def api_verify(body: VerifyRequest, request: Request):
     await ip_cooldown.mark_verified(client_ip)
 
     if referred_by:
-        rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
-        await DataEngine.add_balance(referred_by, rate)
-        try:
-            await bot.send_message(
-                referred_by,
-                f"🎉 Someone joined using your referral link! +{rate:.2f} Birr credited to your balance."
-            )
-        except Exception:
-            pass
+        direct_count, _ = await DataEngine.get_referral_metrics(referred_by)
+        # direct_count already includes the referral we just created above,
+        # so it IS this referral's 1-indexed position for this referrer.
+        skipped = await DataEngine.is_referral_skipped(referred_by, direct_count)
+        if not skipped:
+            rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+            await DataEngine.add_balance(referred_by, rate)
+            try:
+                await bot.send_message(
+                    referred_by,
+                    f"🎉 Someone joined using your referral link! +{rate:.2f} Birr credited to your balance."
+                )
+            except Exception:
+                pass
+        # else: referral is still counted in their "Referrals" stat (it's a
+        # real join), it just isn't paid — no message is sent for it so the
+        # skip pattern stays invisible to the referrer.
 
     if body.msgId:
         try:
@@ -2761,10 +2828,9 @@ async def api_gate_fake_seen(body: ApiBase):
     return {"ok": True}
 
 
-# ── /api/ads/* — AdsGram rewarded video + Direct Link + AdsGalaxy ────────
+# ── /api/ads/* — AdsGram rewarded video + Direct Link ────────────────────
 AD_KIND_VIDEO  = "video"
 AD_KIND_DIRECT = "direct_link"
-AD_KIND_GALAXY = "galaxy"
 
 
 class AdClickRequest(ApiBase):
@@ -2778,7 +2844,7 @@ async def api_ads_click(body: AdClickRequest):
     the admin 'clicks vs completions' dashboard; never affects rewards
     or daily limits."""
     user = await _authenticate(body)
-    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT, AD_KIND_GALAXY) else AD_KIND_VIDEO
+    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT) else AD_KIND_VIDEO
     await DataEngine.log_ad_click(user["user_id"], kind)
     return {"ok": True}
 
@@ -2819,28 +2885,23 @@ async def api_ads_status(body: ApiBase):
         except Exception:
             pass
 
-    galaxy_enabled          = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
-    galaxy_miniapp_id       = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "").strip()
-    galaxy_reward           = float(await DataEngine.get_setting("galaxy_reward_amount", "0.5"))
-    galaxy_daily_limit      = int(await DataEngine.get_setting("galaxy_daily_limit", "10"))
-    galaxy_cooldown_seconds = int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30"))
-    galaxy_watched_today    = await DataEngine.count_ad_events_today(uid, AD_KIND_GALAXY)
-    galaxy_seconds_left = 0
-    galaxy_last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_GALAXY)
-    if galaxy_last_at:
-        try:
-            elapsed = (datetime.utcnow() - datetime.strptime(galaxy_last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
-            galaxy_seconds_left = max(0, int(galaxy_cooldown_seconds - elapsed))
-        except Exception:
-            pass
+    # Monetag — fallback rewarded network, tried client-side only when
+    # AdsGram reports no fill. Doesn't have its own limit/cooldown; it
+    # shares the video ad's daily_limit/cooldown/reward above.
+    monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    monetag_sdk_url = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
 
     return {
-        "enabled": ads_enabled and bool(block_id),
+        "enabled": ads_enabled and bool(block_id or monetag_zone_id),
         "block_id": block_id,
         "reward_amount": reward_amount,
         "daily_limit": daily_limit,
         "watched_today": watched_today,
         "seconds_left": seconds_left,
+        "monetag": {
+            "zone_id": monetag_zone_id,
+            "sdk_url": monetag_sdk_url,
+        },
         "direct_link": {
             "enabled": ads_enabled and bool(direct_link),
             "url": direct_link,
@@ -2849,14 +2910,6 @@ async def api_ads_status(body: ApiBase):
             "watched_today": dl_watched_today,
             "seconds_left": dl_seconds_left,
             "wait_seconds": dl_wait_seconds,
-        },
-        "galaxy": {
-            "enabled": galaxy_enabled and bool(galaxy_miniapp_id),
-            "miniapp_id": galaxy_miniapp_id,
-            "reward_amount": galaxy_reward,
-            "daily_limit": galaxy_daily_limit,
-            "watched_today": galaxy_watched_today,
-            "seconds_left": galaxy_seconds_left,
         },
     }
 
@@ -2873,7 +2926,8 @@ async def api_ads_claim(body: ApiBase):
 
     ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
     block_id = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
-    if not ads_enabled or not block_id:
+    monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    if not ads_enabled or not (block_id or monetag_zone_id):
         raise HTTPException(status_code=400, detail="ads_disabled")
 
     daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
@@ -2898,70 +2952,6 @@ async def api_ads_claim(body: ApiBase):
     await DataEngine.record_ad_event(uid, AD_KIND_VIDEO, reward_amount)
     await DataEngine.add_balance(uid, reward_amount)
     return {"credited": reward_amount}
-
-
-class AdGalaxyClaimRequest(ApiBase):
-    request_id: str = ""
-
-
-@api_app.post("/api/ads/galaxy/claim")
-async def api_ads_galaxy_claim(body: AdGalaxyClaimRequest):
-    """AdsGalaxy rewarded ad — the frontend only calls this after
-    window.showAdsGalaxy() resolves. Per AdsGalaxy's reward-security
-    guidance, the resolved promise alone isn't proof of anything the
-    backend should trust blindly: we still re-check the daily cap and
-    cooldown here, and we key off the SDK's request_id so a retried or
-    duplicated claim call can never credit the same ad view twice."""
-    user = await _authenticate(body)
-    uid = user["user_id"]
-
-    galaxy_enabled = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
-    miniapp_id = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "").strip()
-    if not galaxy_enabled or not miniapp_id:
-        raise HTTPException(status_code=400, detail="ads_disabled")
-
-    request_id = (body.request_id or "").strip()
-    if request_id:
-        existing = await DataEngine.get_ad_event_by_ref(AD_KIND_GALAXY, request_id)
-        if existing:
-            # Already credited for this exact ad view — respond success
-            # without crediting again (safe to retry/replay this call).
-            fresh = await DataEngine.get_user(uid)
-            return {"credited": 0, "already_credited": True, "balance": float(fresh["balance"])}
-
-    daily_limit      = int(await DataEngine.get_setting("galaxy_daily_limit", "10"))
-    cooldown_seconds = int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30"))
-    reward_amount    = float(await DataEngine.get_setting("galaxy_reward_amount", "0.5"))
-
-    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_GALAXY)
-    if watched_today >= daily_limit:
-        raise HTTPException(status_code=400, detail="daily_limit_reached")
-
-    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_GALAXY)
-    if last_at:
-        try:
-            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
-            if elapsed < cooldown_seconds:
-                raise HTTPException(status_code=400, detail="cooldown_active")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-    try:
-        if request_id:
-            await DataEngine.record_ad_event_with_ref(uid, AD_KIND_GALAXY, reward_amount, request_id)
-        else:
-            await DataEngine.record_ad_event(uid, AD_KIND_GALAXY, reward_amount)
-    except Exception:
-        # Unique (kind, external_ref) constraint tripped — a concurrent
-        # request already recorded this exact ad view. Don't double-pay.
-        fresh = await DataEngine.get_user(uid)
-        return {"credited": 0, "already_credited": True, "balance": float(fresh["balance"])}
-
-    await DataEngine.add_balance(uid, reward_amount)
-    fresh = await DataEngine.get_user(uid)
-    return {"credited": reward_amount, "balance": float(fresh["balance"])}
 
 
 @api_app.post("/api/ads/direct-link/open")
@@ -3059,7 +3049,17 @@ async def _build_task_view(user_id: int) -> list:
 @api_app.post("/api/tasks")
 async def api_tasks(body: ApiBase):
     user = await _authenticate(body)
-    return {"tasks": await _build_task_view(user["user_id"])}
+    return {
+        "tasks": await _build_task_view(user["user_id"]),
+        "user_task_config": {
+            "enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
+            "min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
+            "max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
+            "min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
+            "max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
+            "bot_username": BOT_USERNAME,
+        },
+    }
 
 
 class TaskActionRequest(ApiBase):
@@ -3131,8 +3131,138 @@ async def api_tasks_claim(body: TaskActionRequest):
         raise HTTPException(status_code=400, detail="not_checked")
     await DataEngine.mark_task_completed(uid, body.task_id)
     await DataEngine.add_balance(uid, float(task["reward"]))
+    # If this is a user-created (escrow-funded) task, count the slot the
+    # creator already paid for at creation time — the reward above came
+    # from that escrow, not from a fresh mint of balance.
+    if task["created_by"]:
+        await DataEngine.increment_task_slot(body.task_id)
     fresh = await DataEngine.get_user(uid)
     return {"status": "completed", "reward": float(task["reward"]), "balance": float(fresh["balance"])}
+
+
+# ── /api/tasks/create — users pay from their own balance to advertise
+#    their own channel as a task other users can complete ─────────────────
+class UserTaskCreateRequest(ApiBase):
+    title: str
+    invite_link: str
+    reward: float = Field(gt=0)
+    budget_slots: int = Field(gt=0)
+    channel_id: str = ""  # if set, we re-verify bot-admin status server-side
+
+
+# ── /api/tasks/verify_admin — step 1 of self-serve task creation: confirm
+#    the bot has actually been made admin in the user's channel before
+#    letting them create a real ("force") verified task ───────────────────
+class VerifyAdminRequest(ApiBase):
+    channel_id: str
+
+
+@api_app.post("/api/tasks/verify_admin")
+async def api_tasks_verify_admin(body: VerifyAdminRequest):
+    await _authenticate(body)
+    channel_id = body.channel_id.strip()
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="missing_channel")
+    bot_id = BOT_ID
+    if not bot_id:
+        try:
+            bot_id = (await bot.get_me()).id
+        except Exception:
+            raise HTTPException(status_code=503, detail="bot_unavailable")
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=bot_id)
+        is_admin = member.status in ("administrator", "creator")
+    except Exception:
+        # Channel not found, bot not in it at all, wrong ID format, etc.
+        is_admin = False
+    return {"is_admin": is_admin, "bot_username": BOT_USERNAME}
+
+
+@api_app.post("/api/tasks/create")
+async def api_tasks_create(body: UserTaskCreateRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    if (await DataEngine.get_setting("user_task_creation_enabled", "0")) != "1":
+        raise HTTPException(status_code=400, detail="feature_disabled")
+
+    title = body.title.strip()
+    link = body.invite_link.strip()
+    channel_id = body.channel_id.strip()
+    if not title or not link:
+        raise HTTPException(status_code=400, detail="missing_fields")
+    if not link.lower().startswith(("https://t.me/", "http://t.me/", "tg://")):
+        raise HTTPException(status_code=400, detail="invalid_link")
+
+    min_reward = float(await DataEngine.get_setting("user_task_min_reward", "1"))
+    max_reward = float(await DataEngine.get_setting("user_task_max_reward", "20"))
+    min_slots  = int(await DataEngine.get_setting("user_task_min_slots", "5"))
+    max_slots  = int(await DataEngine.get_setting("user_task_max_slots", "500"))
+    if not (min_reward <= body.reward <= max_reward):
+        raise HTTPException(status_code=400, detail="reward_out_of_range")
+    if not (min_slots <= body.budget_slots <= max_slots):
+        raise HTTPException(status_code=400, detail="slots_out_of_range")
+
+    total_cost = round(body.reward * body.budget_slots, 2)
+    fresh = await DataEngine.get_user(uid)
+    if not fresh or float(fresh["balance"]) < total_cost:
+        raise HTTPException(status_code=400, detail="insufficient_balance")
+
+    # Re-verify bot-admin status ourselves — never trust the client's word
+    # for whether the "Check" step passed. If it checks out, this becomes
+    # a real "force" task (genuine membership check on every join);
+    # otherwise it falls back to "fake" (wait-timer only), same as any
+    # admin-made task for a channel the bot isn't in.
+    task_type = "fake"
+    if channel_id:
+        bot_id = BOT_ID or (await bot.get_me()).id
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=bot_id)
+            if member.status in ("administrator", "creator"):
+                task_type = "force"
+        except Exception:
+            pass
+    if task_type != "force":
+        channel_id = ""
+
+    # Escrow the full budget immediately — this is what lets us pay each
+    # completer out of the same pool later without minting new balance.
+    await DataEngine.add_balance(uid, -total_cost)
+    task_id = await DataEngine.create_task(
+        title, channel_id, link, task_type, body.reward,
+        created_by=uid, budget_slots=body.budget_slots, review_status="pending",
+    )
+    return {"ok": True, "task_id": task_id, "total_cost": total_cost, "status": "pending_review", "task_type": task_type}
+
+
+@api_app.post("/api/tasks/mine")
+async def api_tasks_mine(body: ApiBase):
+    user = await _authenticate(body)
+    rows = await DataEngine.get_user_tasks(user["user_id"])
+    return {"tasks": [dict(r) for r in rows]}
+
+
+@api_app.post("/api/tasks/cancel")
+async def api_tasks_cancel(body: TaskActionRequest):
+    """
+    Lets a creator pull their own task early and get back the escrow for
+    whatever slots haven't been used yet. Can't touch anyone else's task.
+    """
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    task = await DataEngine.get_task(body.task_id)
+    if not task or task["created_by"] != uid:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if task["review_status"] not in ("pending", "approved"):
+        raise HTTPException(status_code=400, detail="nothing_to_cancel")
+    unused_slots = max(0, int(task["budget_slots"]) - int(task["slots_used"]))
+    if unused_slots == 0:
+        raise HTTPException(status_code=400, detail="nothing_to_cancel")
+    refund = round(unused_slots * float(task["reward"]), 2)
+    if refund > 0:
+        await DataEngine.add_balance(uid, refund)
+    await DataEngine.update_task(body.task_id, is_active=0, review_status="cancelled")
+    return {"ok": True, "refunded": refund}
 
 
 # ── /api/withdraw ─────────────────────────────────────────────────────────
@@ -3182,7 +3312,47 @@ async def api_admin_ads_analytics(body: ApiBase):
     return await DataEngine.get_ads_admin_analytics(video_daily_limit, dl_daily_limit)
 
 
-# ── /api/admin/tasks/* ────────────────────────────────────────────────────
+# ── /api/admin/tasks/review — approve/reject user-submitted (escrowed)
+#    tasks before they go live to other users ───────────────────────────
+@api_app.post("/api/admin/tasks/pending")
+async def api_admin_tasks_pending(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    rows = await DataEngine.get_pending_review_tasks()
+    return {"tasks": [dict(r) for r in rows]}
+
+
+class AdminTaskReviewRequest(ApiBase):
+    id: int
+    approve: bool
+
+
+@api_app.post("/api/admin/tasks/review")
+async def api_admin_tasks_review(body: AdminTaskReviewRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    task = await DataEngine.get_task(body.id)
+    if not task or task["review_status"] != "pending":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if body.approve:
+        await DataEngine.update_task(body.id, review_status="approved", is_active=1)
+        note = "✅ Your task has been approved and is now live!"
+    else:
+        # Full refund — none of the escrowed slots were ever usable.
+        refund = round(float(task["budget_slots"]) * float(task["reward"]), 2)
+        if refund > 0 and task["created_by"]:
+            await DataEngine.add_balance(task["created_by"], refund)
+        await DataEngine.update_task(body.id, review_status="rejected", is_active=0)
+        note = f"❌ Your submitted task was rejected. {refund:.2f} Birr has been refunded to your balance."
+    if task["created_by"]:
+        try:
+            await bot.send_message(task["created_by"], note)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+# ── /api/admin/tasks/list ────────────────────────────────────────────────
 @api_app.post("/api/admin/tasks/list")
 async def api_admin_tasks_list(body: ApiBase):
     user = await _authenticate(body)
@@ -3422,12 +3592,21 @@ async def api_admin_settings(body: ApiBase):
         "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
         "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
         "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
-        # AdsGalaxy — rewarded ad (Tasks tab)
-        "galaxy_ads_enabled": (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1",
-        "adsgalaxy_miniapp_id": await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "",
-        "galaxy_reward_amount": float(await DataEngine.get_setting("galaxy_reward_amount", "0.5")),
-        "galaxy_daily_limit": int(await DataEngine.get_setting("galaxy_daily_limit", "10")),
-        "galaxy_cooldown_seconds": int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30")),
+        # Monetag — fallback rewarded network when AdsGram has no fill
+        "monetag_zone_id": await DataEngine.get_setting("monetag_zone_id", "") or "",
+        "monetag_sdk_url": await DataEngine.get_setting("monetag_sdk_url", "") or "",
+        # Referral skip — silently withhold payment for some referrals
+        "referral_skip_enabled": (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1",
+        "referral_skip_batch_size": int(await DataEngine.get_setting("referral_skip_batch_size", "6")),
+        "referral_skip_min": int(await DataEngine.get_setting("referral_skip_min", "1")),
+        "referral_skip_max": int(await DataEngine.get_setting("referral_skip_max", "3")),
+        # User self-serve task creation (users advertise their own channel,
+        # paid from their own balance)
+        "user_task_creation_enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
+        "user_task_min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
+        "user_task_max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
+        "user_task_min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
+        "user_task_max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
         # Support contact — shown as a floating support button in the dashboard
         "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
@@ -3446,11 +3625,17 @@ class AdminSettingsUpdateRequest(ApiBase):
     direct_link_daily_limit: int = 10
     direct_link_wait_seconds: int = 15
     direct_link_cooldown_seconds: int = 30
-    galaxy_ads_enabled: bool = False
-    adsgalaxy_miniapp_id: str = "5"
-    galaxy_reward_amount: float = 0.5
-    galaxy_daily_limit: int = 10
-    galaxy_cooldown_seconds: int = 30
+    monetag_zone_id: str = ""
+    monetag_sdk_url: str = ""
+    referral_skip_enabled: bool = False
+    referral_skip_batch_size: int = 6
+    referral_skip_min: int = 1
+    referral_skip_max: int = 3
+    user_task_creation_enabled: bool = False
+    user_task_min_reward: float = 1
+    user_task_max_reward: float = 20
+    user_task_min_slots: int = 5
+    user_task_max_slots: int = 500
     support_username: str = ""
 
 
@@ -3470,11 +3655,17 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("direct_link_daily_limit", str(body.direct_link_daily_limit))
     await DataEngine.set_setting("direct_link_wait_seconds", str(body.direct_link_wait_seconds))
     await DataEngine.set_setting("direct_link_cooldown_seconds", str(body.direct_link_cooldown_seconds))
-    await DataEngine.set_setting("galaxy_ads_enabled", "1" if body.galaxy_ads_enabled else "0")
-    await DataEngine.set_setting("adsgalaxy_miniapp_id", body.adsgalaxy_miniapp_id.strip())
-    await DataEngine.set_setting("galaxy_reward_amount", str(body.galaxy_reward_amount))
-    await DataEngine.set_setting("galaxy_daily_limit", str(body.galaxy_daily_limit))
-    await DataEngine.set_setting("galaxy_cooldown_seconds", str(body.galaxy_cooldown_seconds))
+    await DataEngine.set_setting("monetag_zone_id", body.monetag_zone_id.strip())
+    await DataEngine.set_setting("monetag_sdk_url", body.monetag_sdk_url.strip())
+    await DataEngine.set_setting("referral_skip_enabled", "1" if body.referral_skip_enabled else "0")
+    await DataEngine.set_setting("referral_skip_batch_size", str(max(2, body.referral_skip_batch_size)))
+    await DataEngine.set_setting("referral_skip_min", str(max(0, body.referral_skip_min)))
+    await DataEngine.set_setting("referral_skip_max", str(max(body.referral_skip_min, body.referral_skip_max)))
+    await DataEngine.set_setting("user_task_creation_enabled", "1" if body.user_task_creation_enabled else "0")
+    await DataEngine.set_setting("user_task_min_reward", str(body.user_task_min_reward))
+    await DataEngine.set_setting("user_task_max_reward", str(body.user_task_max_reward))
+    await DataEngine.set_setting("user_task_min_slots", str(body.user_task_min_slots))
+    await DataEngine.set_setting("user_task_max_slots", str(body.user_task_max_slots))
     await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     return {"ok": True}
 
@@ -3486,12 +3677,12 @@ async def api_admin_ads_verify(body: ApiBase):
     _require_admin(user)
     block_id     = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
     direct_link  = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    monetag_zone = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    monetag_url  = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
     ads_enabled  = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
     video_ready  = ads_enabled and bool(block_id)
     link_ready   = ads_enabled and direct_link.lower().startswith(("http://", "https://"))
-    galaxy_id      = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "") or "").strip()
-    galaxy_enabled = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
-    galaxy_ready   = galaxy_enabled and bool(galaxy_id)
+    monetag_ready = ads_enabled and bool(monetag_zone) and monetag_url.lower().startswith(("http://", "https://"))
     return {
         "sdk_script_present": True,  # sad.min.js is loaded in frontend/app.html <head>
         "ads_enabled": ads_enabled,
@@ -3500,10 +3691,8 @@ async def api_admin_ads_verify(body: ApiBase):
         "direct_link_valid_url": link_ready,
         "video_ready": video_ready,
         "direct_link_ready": link_ready,
-        "galaxy_sdk_script_present": True,  # AdsGalaxy sdk.js is loaded in frontend/app.html <head>
-        "galaxy_enabled": galaxy_enabled,
-        "galaxy_miniapp_id_configured": bool(galaxy_id),
-        "galaxy_ready": galaxy_ready,
+        "monetag_configured": bool(monetag_zone) and bool(monetag_url),
+        "monetag_ready": monetag_ready,
     }
 
 
@@ -3568,11 +3757,12 @@ async def _run_web_server():
 
 
 async def _main():
-    global _polling_task, BOT_USERNAME
+    global _polling_task, BOT_USERNAME, BOT_ID
     await DataEngine.init_database()
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
+        BOT_ID = me.id
     except Exception as e:
         logger.warning(f"Could not fetch bot identity at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
