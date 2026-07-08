@@ -11,7 +11,6 @@
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
-<script src="https://app.adsgalaxy.online/sdk.js/sdk.js?id=5"></script>
 <script src="config.js"></script>
 <style>
 /* ══════════════════════════════════════════════════════════════════
@@ -393,6 +392,7 @@ const FORCE_ADMIN_TAB = _p.get("admin") === "1";
 
 let ME = null;
 let ADS = null;
+let UTC = null; // user_task_config from /api/tasks
 let adController = null;
 
 function toast(msg, type){
@@ -495,6 +495,7 @@ document.getElementById("supportFab").addEventListener("click", openSupport);
 async function renderHome(view){
   await refreshMe();
   ADS = await api("/api/ads/status").catch(() => null);
+  ensureMonetagSdk();
   view.innerHTML = `
     <div class="cascade">
     <div class="hero">
@@ -527,9 +528,9 @@ async function renderHome(view){
 
 /* ── Rewarded ads (AdsGram) ─────────────────────────────────────── */
 function adsCardHTML(){
-  if (!ADS || (!ADS.block_id && !ADS.direct_link?.url)) return "";
+  if (!ADS || (!ADS.block_id && !ADS.monetag?.zone_id && !ADS.direct_link?.url)) return "";
 
-  const videoBlock = ADS.block_id ? (() => {
+  const videoBlock = (ADS.block_id || ADS.monetag?.zone_id) ? (() => {
     const capped = ADS.watched_today >= ADS.daily_limit;
     return `
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
@@ -615,48 +616,98 @@ function startAdCooldownTicker(){
   }
 }
 
-async function watchAd(){
-  if (!ADS?.block_id){
-    return toast("❌ Ads not configured yet");
+/* ── Monetag (fallback rewarded network) ───────────────────────────
+   AdsGram's zone/domain is fixed at build time (sad.min.js in <head>),
+   but Monetag's SDK script URL + zone ID are admin-configurable at
+   runtime, so it has to be injected dynamically once we know them. */
+let _monetagLoading = null;
+function ensureMonetagSdk(){
+  const zone = ADS?.monetag?.zone_id;
+  const src  = ADS?.monetag?.sdk_url;
+  if (!zone || !src) return null;
+  const fnName = `show_${zone}`;
+  if (window[fnName]) return fnName; // already loaded
+  if (_monetagLoading === src) return null; // load in flight
+  _monetagLoading = src;
+  const s = document.createElement("script");
+  s.src = src;
+  s.setAttribute("data-zone", zone);
+  s.setAttribute("data-sdk", fnName);
+  document.head.appendChild(s);
+  return null; // not ready on this call; will be ready by the next
+}
+
+async function tryMonetagFallback(){
+  const zone = ADS?.monetag?.zone_id;
+  if (!zone) return false;
+  const fnName = `show_${zone}`;
+  if (typeof window[fnName] !== "function") return false; // not loaded yet
+  try {
+    await window[fnName]();
+    return true; // ad watched to completion
+  } catch (e) {
+    return false; // no fill / skipped / failed
   }
-  if (!window.Adsgram){
-    return toast("❌ Couldn't load ads — try again shortly");
+}
+
+async function watchAd(){
+  if (!ADS?.block_id && !ADS?.monetag?.zone_id){
+    return toast("❌ Ads not configured yet");
   }
   const btn = document.getElementById("watchAdBtn");
   api("/api/ads/click", { kind: "video" }).catch(() => {}); // analytics-only, never blocks
-  if (!adController){
-    adController = window.Adsgram.init({ blockId: ADS.block_id });
-    // Without these listeners, AdsGram shows its own raw technical popup
-    // (e.g. "Block xxx is not active") whenever no ad can be served.
-    // Subscribing here suppresses that default alert — we show our own
-    // friendly message instead, always in English.
-    const noAdsMsg = () => toast("⌛ No ads available right now — please try again later");
-    adController.addEventListener("onBannerNotFound", noAdsMsg);
-    adController.addEventListener("onNonStopShow",    noAdsMsg);
-    adController.addEventListener("onTooLongSession", noAdsMsg);
-  }
   if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
 
-  try {
-    await adController.show();
-  } catch (adErr) {
-    // adErr.state tells us roughly what happened:
-    //  'load'    → no ad was available to show at all
-    //  'render'  → ad found but failed to display
-    //  'playing' → ad was showing, then closed/skipped early
-    const state = adErr?.state;
-    const msg = (state === "load" || state === "render")
-      ? "⌛ No ads available right now — please try again later"
-      : "⚠️ Ad not completed — no reward";
-    toast(msg);
+  let watched = false;
+
+  if (ADS?.block_id && window.Adsgram){
+    if (!adController){
+      adController = window.Adsgram.init({ blockId: ADS.block_id });
+      // Without these listeners, AdsGram shows its own raw technical popup
+      // (e.g. "Block xxx is not active") whenever no ad can be served.
+      // Subscribing here suppresses that default alert — we show our own
+      // friendly message instead, always in English.
+      const noAdsMsg = () => {};
+      adController.addEventListener("onBannerNotFound", noAdsMsg);
+      adController.addEventListener("onNonStopShow",    noAdsMsg);
+      adController.addEventListener("onTooLongSession",  noAdsMsg);
+    }
+    try {
+      await adController.show();
+      watched = true;
+    } catch (adErr) {
+      // adErr.state: 'load' (no ad available) / 'render' (found but failed
+      // to display) / 'playing' (closed/skipped early). Only 'load'/'render'
+      // — a genuine no-fill — should trigger the Monetag fallback below;
+      // an early skip should NOT quietly retry on another network.
+      if (adErr?.state !== "load" && adErr?.state !== "render"){
+        toast("⚠️ Ad not completed — no reward");
+        if (btn){ btn.disabled = false; btn.textContent = "▶️ Watch Ad"; }
+        await renderHome(document.getElementById("view"));
+        return;
+      }
+      // fall through to Monetag fallback
+    }
+  }
+
+  if (!watched){
+    // AdsGram wasn't available/configured, or reported no fill — try
+    // Monetag (if the admin has one configured) before giving up.
+    watched = await tryMonetagFallback();
+  }
+
+  if (!watched){
+    toast("⌛ No ads available right now — please try again later");
+    if (btn){ btn.disabled = false; btn.textContent = "▶️ Watch Ad"; }
     await renderHome(document.getElementById("view"));
     return;
   }
 
   try {
-    // Ad watched to completion — ask OUR backend to credit it. The backend
-    // re-checks the daily cap and cooldown itself, so this call is the
-    // only thing that can actually move money, not the ad SDK's promise.
+    // Ad watched to completion (on whichever network) — ask OUR backend to
+    // credit it. The backend re-checks the daily cap and cooldown itself,
+    // so this call is the only thing that can actually move money, not
+    // either ad SDK's promise.
     const res = await api("/api/ads/claim", {});
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(res.credited)} Birr credited`);
@@ -718,105 +769,6 @@ async function openDirectLinkAd(){
   }, 1000);
 }
 
-/* ── AdsGalaxy (rewarded ad, front-and-center on the Tasks tab) ────
-   Integration follows AdsGalaxy's own dashboard-generated snippet
-   exactly: static <script src="...sdk.js?id=5"> in <head>, and
-   window.showAdsGalaxy({ miniappId }) on tap. The miniapp_id still
-   comes from admin settings (defaults to "5") so it can be changed
-   without a code edit if the registered ID ever changes. */
-function galaxyAdCardHTML(){
-  const g = ADS?.galaxy;
-  if (!g || !g.enabled) return "";
-  const capped = g.watched_today >= g.daily_limit;
-  return `
-    <div class="card" id="galaxyAdCard" style="border-color:rgba(200,242,77,.18);margin-bottom:14px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
-        <div>
-          <div style="font-weight:700;font-size:.86rem">🌌 Watch Ads</div>
-          <div class="mini" style="margin-top:2px">Earn ${fmt(g.reward_amount)} Birr per view</div>
-        </div>
-        <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">${g.watched_today}/${g.daily_limit}</div>
-      </div>
-      <button class="btn gold" id="galaxyAdBtn" onclick="watchGalaxyAd()" ${capped ? "disabled" : ""}>
-        ${capped ? "✅ Daily Limit Reached" : "🌌 Watch Ads"}
-      </button>
-    </div>
-  `;
-}
-
-function startGalaxyCooldownTicker(){
-  clearInterval(window._galaxyTick);
-  const g = ADS?.galaxy;
-  if (!g || !g.enabled) return;
-
-  if (g.seconds_left > 0){
-    let left = g.seconds_left;
-    const btn = document.getElementById("galaxyAdBtn");
-    if (btn){
-      btn.disabled = true;
-      const label = () => `⏳ Wait ${left}s`;
-      btn.textContent = label();
-      window._galaxyTick = setInterval(() => {
-        left -= 1;
-        if (left <= 0){
-          clearInterval(window._galaxyTick);
-          btn.disabled = false;
-          btn.textContent = "🌌 Watch Ads";
-        } else {
-          btn.textContent = label();
-        }
-      }, 1000);
-    }
-  }
-}
-
-async function watchGalaxyAd(){
-  const g = ADS?.galaxy;
-  if (!g?.enabled){
-    return toast("❌ Ads not configured yet");
-  }
-  if (typeof window.showAdsGalaxy !== "function"){
-    return toast("❌ Couldn't load ads — try again shortly");
-  }
-  const btn = document.getElementById("galaxyAdBtn");
-  api("/api/ads/click", { kind: "galaxy" }).catch(() => {}); // analytics-only, never blocks
-  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
-
-  let result;
-  try {
-    // Matches AdsGalaxy's own dashboard-generated snippet exactly:
-    // window.showAdsGalaxy({ miniappId: ... }). Only await it if it
-    // actually returns a promise, in case it's fire-and-forget instead.
-    const ret = window.showAdsGalaxy({ miniappId: g.miniapp_id });
-    result = (ret && typeof ret.then === "function") ? await ret : ret;
-  } catch (adErr) {
-    const code = adErr?.code;
-    const msg = code === "NO_FILL"            ? "⌛ No ads available right now — please try again later"
-              : code === "INVALID_INIT_DATA"  ? "❌ Please open this from inside Telegram"
-              : code === "APP_NOT_READY"      ? "⌛ Ads aren't ready yet — try again in a moment"
-              : "⚠️ Ad not completed — no reward";
-    toast(msg);
-    await renderTasks(document.getElementById("view"));
-    return;
-  }
-
-  try {
-    // The resolved promise alone isn't trusted for payouts — the backend
-    // re-checks the daily cap/cooldown, and request_id makes the credit
-    // idempotent so a retry can never pay out twice for the same ad.
-    const res = await api("/api/ads/galaxy/claim", { request_id: result?.request_id || "" });
-    tg?.HapticFeedback?.notificationOccurred("success");
-    toast(res.already_credited ? "✅ Already credited for this ad" : `✅ +${fmt(res.credited)} Birr credited`);
-    if (ME) ME.balance = res.balance;
-  } catch (claimErr) {
-    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
-              : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
-              : "❌ Couldn't credit the reward — try again";
-    toast(msg);
-  }
-  await renderTasks(document.getElementById("view"));
-}
-
 /* ══════════════════════════════════════════════════════════════════
    TASKS
    ══════════════════════════════════════════════════════════════════ */
@@ -824,10 +776,9 @@ let taskTimer = null;
 
 async function renderTasks(view){
   const [data] = await Promise.all([api("/api/tasks"), loadGateStatus().catch(() => null)]);
-  ADS = await api("/api/ads/status").catch(() => ADS);
   clearInterval(taskTimer);
+  UTC = data.user_task_config || null; // stash for the create-task form
 
-  const galaxyHTML = galaxyAdCardHTML();
   const showFakeSection = !ME?.is_admin && GATE.fake_channels?.length && !GATE.fake_seen;
   const fakeSectionHTML = showFakeSection ? `
     <h2 class="sect" style="margin-top:0">Recommended Channels</h2>
@@ -842,14 +793,23 @@ async function renderTasks(view){
     </div>
   ` : "";
 
+  const createTaskHTML = (UTC?.enabled) ? `
+    <div class="card" id="createTaskCard" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+      <div style="font-weight:700">📢 Promote your own channel</div>
+      <div class="mini">Pay from your balance to have other users join your channel as a task.</div>
+      <button class="btn ghost" id="createTaskToggle" onclick="openCreateTask()">➕ Create Task</button>
+      <div id="createTaskForm" style="display:none;flex-direction:column;gap:8px;margin-top:4px;"></div>
+    </div>
+  ` : "";
+
   if (!data.tasks.length){
-    view.innerHTML = galaxyHTML + fakeSectionHTML + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
-    startGalaxyCooldownTicker();
+    view.innerHTML = fakeSectionHTML + createTaskHTML + myTasksHTML() + `<h2 class="sect">Tasks</h2><div class="empty">📭 No tasks right now. Check back later!</div>`;
+    await renderMyTasks();
     return;
   }
 
-  view.innerHTML = galaxyHTML + fakeSectionHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>`;
-  startGalaxyCooldownTicker();
+  view.innerHTML = fakeSectionHTML + createTaskHTML + `<h2 class="sect">Tasks — Join & Earn</h2><div id="taskList" class="cascade"></div>` + myTasksHTML();
+  await renderMyTasks();
   const list = document.getElementById("taskList");
 
   // Server only tells us "claimable" once the wait timer is done — we then
@@ -953,6 +913,166 @@ async function renderTasks(view){
       }
     }
   };
+}
+
+/* ── User self-serve task creation ("promote your own channel") ────── */
+function myTasksHTML(){
+  return `<h2 class="sect">My Submitted Tasks</h2><div id="myTaskList"><div class="skel skel-card"></div></div>`;
+}
+
+function myTaskStatusLabel(t){
+  if (t.review_status === "pending")  return `<span class="pill-tag fake">Pending Review</span>`;
+  if (t.review_status === "rejected") return `<span class="pill-tag" style="background:#5a2020;color:#ff9d9d">Rejected</span>`;
+  if (t.review_status === "cancelled") return `<span class="pill-tag" style="background:#333">Cancelled</span>`;
+  if (t.budget_slots > 0 && t.slots_used >= t.budget_slots) return `<span class="pill-tag" style="background:#333">Sold Out</span>`;
+  return `<span class="pill-tag force">Live</span>`;
+}
+
+async function renderMyTasks(){
+  const box = document.getElementById("myTaskList");
+  if (!box) return;
+  let mine = [];
+  try {
+    const r = await api("/api/tasks/mine", {});
+    mine = r.tasks || [];
+  } catch (e) { box.innerHTML = ""; return; }
+  if (!mine.length){ box.innerHTML = `<div class="empty">You haven't created any tasks yet.</div>`; return; }
+  box.innerHTML = mine.map(t => {
+    const canCancel = (t.review_status === "pending" || t.review_status === "approved") && t.slots_used < t.budget_slots;
+    return `
+      <div class="card" style="margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div style="font-weight:700;font-size:.88rem">${escapeHtml(t.title)}</div>
+          ${myTaskStatusLabel(t)}
+        </div>
+        <div class="mini" style="margin-top:4px">
+          ${t.slots_used}/${t.budget_slots} joined · ${fmt(t.reward)} Birr each
+        </div>
+        ${canCancel ? `<button class="task-btn check" style="margin-top:8px" onclick="cancelMyTask(${t.id})">Cancel & Refund Unused</button>` : ""}
+      </div>`;
+  }).join("");
+}
+
+function openCreateTask(){
+  const wrap = document.getElementById("createTaskForm");
+  const toggleBtn = document.getElementById("createTaskToggle");
+  if (!wrap) return;
+  if (wrap.style.display !== "none"){ wrap.style.display = "none"; return; }
+  toggleBtn.style.display = "none";
+  wrap.style.display = "flex";
+  renderCtStep1();
+}
+
+// verified channel_id carried from step 1 into step 2 (empty = unverified/"fake")
+let _ctVerifiedChannel = "";
+
+function renderCtStep1(){
+  const wrap = document.getElementById("createTaskForm");
+  const botTag = UTC.bot_username ? `@${escapeHtml(UTC.bot_username)}` : "the bot";
+  wrap.innerHTML = `
+    <div class="mini">
+      To let us verify people actually joined, first add ${botTag} as an
+      <b>Admin</b> in your channel. Then enter your Channel ID/username below and tap Check.
+    </div>
+    <label class="f">Channel ID or @username</label>
+    <input id="ctChannelId" placeholder="@yourchannel or -1001234567890">
+    <button class="btn gold" id="ctCheckBtn" onclick="checkCtAdmin()">🔄 I've Added the Bot — Check</button>
+    <button class="btn ghost" onclick="skipCtVerify()">Skip verification (unverified task)</button>
+  `;
+}
+
+async function checkCtAdmin(){
+  const channel_id = document.getElementById("ctChannelId").value.trim();
+  if (!channel_id) return toast("❌ Enter your channel ID or @username first");
+  const btn = document.getElementById("ctCheckBtn");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin-ico"></span> Checking…`;
+  try {
+    const r = await api("/api/tasks/verify_admin", { channel_id });
+    if (r.is_admin){
+      tg?.HapticFeedback?.notificationOccurred("success");
+      _ctVerifiedChannel = channel_id;
+      renderCtStep2(true);
+    } else {
+      toast("❌ Bot isn't an admin there yet — add it, then tap Check again");
+      btn.disabled = false;
+      btn.innerHTML = "🔄 I've Added the Bot — Check";
+    }
+  } catch (e){
+    toast("⚠️ Couldn't verify — try again");
+    btn.disabled = false;
+    btn.innerHTML = "🔄 I've Added the Bot — Check";
+  }
+}
+
+function skipCtVerify(){
+  _ctVerifiedChannel = "";
+  renderCtStep2(false);
+}
+
+function renderCtStep2(verified){
+  const wrap = document.getElementById("createTaskForm");
+  wrap.innerHTML = `
+    <div class="mini">
+      ${verified ? "✅ Verified — this will be a real, membership-checked task."
+                 : "⚠️ Unverified — this will be a wait-timer-only task (no real join check)."}
+    </div>
+    <label class="f">Channel Title</label>
+    <input id="ctTitle" placeholder="e.g. My News Channel">
+    <label class="f">Invite Link</label>
+    <input id="ctLink" placeholder="https://t.me/yourchannel">
+    <label class="f">Reward per Person (Birr, ${UTC.min_reward}–${UTC.max_reward})</label>
+    <input id="ctReward" type="number" step="0.1" min="${UTC.min_reward}" max="${UTC.max_reward}" oninput="updateCtCost()">
+    <label class="f">Number of People (${UTC.min_slots}–${UTC.max_slots})</label>
+    <input id="ctSlots" type="number" min="${UTC.min_slots}" max="${UTC.max_slots}" oninput="updateCtCost()">
+    <div class="mini" id="ctCost">Total cost: 0.00 Birr</div>
+    <button class="btn gold" id="ctSubmitBtn" onclick="submitCreateTask()">Submit for Review</button>
+  `;
+}
+
+function updateCtCost(){
+  const r = parseFloat(document.getElementById("ctReward")?.value) || 0;
+  const s = parseInt(document.getElementById("ctSlots")?.value, 10) || 0;
+  const el = document.getElementById("ctCost");
+  if (el) el.textContent = `Total cost: ${fmt(r * s)} Birr (deducted from your balance now)`;
+}
+
+async function submitCreateTask(){
+  const title = document.getElementById("ctTitle").value.trim();
+  const invite_link = document.getElementById("ctLink").value.trim();
+  const reward = parseFloat(document.getElementById("ctReward").value);
+  const budget_slots = parseInt(document.getElementById("ctSlots").value, 10);
+  if (!title || !invite_link || !reward || !budget_slots){
+    return toast("❌ Please fill in every field");
+  }
+  const btn = document.getElementById("ctSubmitBtn");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin-ico"></span> Submitting…`;
+  try {
+    await api("/api/tasks/create", { title, invite_link, reward, budget_slots, channel_id: _ctVerifiedChannel });
+    tg?.HapticFeedback?.notificationOccurred("success");
+    toast("✅ Submitted — waiting for admin approval");
+    await renderTasks(document.getElementById("view"));
+  } catch (e){
+    const msg = e.message === "insufficient_balance" ? "❌ Not enough balance"
+              : e.message === "reward_out_of_range" ? `❌ Reward must be ${UTC.min_reward}-${UTC.max_reward} Birr`
+              : e.message === "slots_out_of_range"  ? `❌ Number of people must be ${UTC.min_slots}-${UTC.max_slots}`
+              : e.message === "invalid_link"        ? "❌ Please use a valid t.me invite link"
+              : "❌ Couldn't submit — try again";
+    toast(msg);
+    btn.disabled = false;
+    btn.innerHTML = "Submit for Review";
+  }
+}
+
+async function cancelMyTask(id){
+  try {
+    const r = await api("/api/tasks/cancel", { task_id: id });
+    toast(`✅ Cancelled — ${fmt(r.refunded)} Birr refunded`);
+    await renderTasks(document.getElementById("view"));
+  } catch (e){
+    toast("❌ Couldn't cancel — try again");
+  }
 }
 
 function taskCardHTML(t){
@@ -1167,8 +1287,29 @@ async function paintAdminBody(){
 
 /* ── Admin: Tasks ─────────────────────────────────────────────── */
 async function adminTasks(body){
-  const { tasks } = await api("/api/admin/tasks/list");
-  body.innerHTML = `
+  const [{ tasks }, { tasks: pending }] = await Promise.all([
+    api("/api/admin/tasks/list"),
+    api("/api/admin/tasks/pending").catch(() => ({ tasks: [] })),
+  ]);
+  const pendingHTML = pending.length ? `
+    <h2 class="sect" style="margin-top:0">User-Submitted Tasks Awaiting Review (${pending.length})</h2>
+    <div class="card" id="pendingTaskList" style="display:flex;flex-direction:column;gap:10px;">
+      ${pending.map(t => `
+        <div class="card" style="margin:0;">
+          <div style="font-weight:700;font-size:.88rem">${escapeHtml(t.title)}</div>
+          <div class="mini" style="margin:4px 0">
+            By user ${t.created_by} · ${t.budget_slots} people × ${fmt(t.reward)} Birr = ${fmt(t.budget_slots * t.reward)} Birr escrowed
+          </div>
+          <div class="mini">${escapeHtml(t.invite_link)}</div>
+          <div style="display:flex;gap:8px;margin-top:8px;">
+            <button class="btn gold" style="flex:1" onclick="reviewUserTask(${t.id}, true)">✅ Approve</button>
+            <button class="btn ghost" style="flex:1" onclick="reviewUserTask(${t.id}, false)">❌ Reject & Refund</button>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+  body.innerHTML = pendingHTML + `
     <div class="card">
       <label class="f">Task Title</label>
       <input id="atTitle" placeholder="e.g. Join our News Channel">
@@ -1191,6 +1332,15 @@ async function adminTasks(body){
     </div>
   `;
   window._tasksCache = tasks;
+}
+async function reviewUserTask(id, approve){
+  try {
+    await api("/api/admin/tasks/review", { id, approve });
+    toast(approve ? "✅ Task approved" : "❌ Task rejected & refunded");
+    await paintAdminBody();
+  } catch (e){
+    toast("❌ Couldn't process — try again");
+  }
 }
 function adminTaskRow(t, i, total){
   const typeTag = t.task_type === "force" ? `<span class="pill-tag force">FORCE</span>` : `<span class="pill-tag fake">FAKE</span>`;
@@ -1478,25 +1628,61 @@ async function adminSettings(body){
       <input id="stAdDlCooldown" type="number" value="${s.direct_link_cooldown_seconds}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-      <h2 class="sect" style="margin:0">AdsGalaxy (Watch Ads)</h2>
-      <button class="btn sm ghost" style="margin-top:14px" onclick="checkGalaxyConnection()">🔍 Check Connection</button>
-    </div>
-    <div id="galaxyCheckResult"></div>
+    <h2 class="sect">Monetag (Fallback when AdsGram has no fill)</h2>
     <div class="card">
-      <label class="f">Enable AdsGalaxy</label>
-      <select id="stGalaxyEnabled">
-        <option value="0" ${!s.galaxy_ads_enabled ? "selected" : ""}>Disabled</option>
-        <option value="1" ${s.galaxy_ads_enabled ? "selected" : ""}>Enabled</option>
+      <div class="mini" style="margin-bottom:10px">
+        Optional. If set, the app tries Monetag automatically whenever AdsGram
+        reports no ad available — it uses the same reward/limit/cooldown
+        settings as AdsGram above.
+      </div>
+      <label class="f">Monetag SDK Script URL</label>
+      <input id="stMonetagUrl" type="text" placeholder="e.g. https://your-zone-domain.com/sdk.js" value="${escapeHtml(s.monetag_sdk_url || '')}">
+      <label class="f">Monetag Zone ID</label>
+      <input id="stMonetagZone" type="text" placeholder="e.g. 123456" value="${escapeHtml(s.monetag_zone_id || '')}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
+    <h2 class="sect">Referral Payout Skipping</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        When on, not every successful referral gets paid. In every batch of
+        "Batch Size" referrals a given user brings in, a random number of
+        them (between Min and Max) is silently skipped — still counted in
+        their "Referrals" stat, just not paid. Reduces payout cost without
+        the referrer being able to tell which invite was skipped.
+      </div>
+      <label class="f">Enabled</label>
+      <select id="stRefSkipEnabled">
+        <option value="0" ${!s.referral_skip_enabled ? "selected" : ""}>Off — pay every referral</option>
+        <option value="1" ${s.referral_skip_enabled ? "selected" : ""}>On</option>
       </select>
-      <label class="f">AdsGalaxy Mini App ID</label>
-      <input id="stGalaxyMiniappId" type="text" placeholder="e.g. 5" value="${escapeHtml(s.adsgalaxy_miniapp_id || '')}">
-      <label class="f">Reward per Ad (Birr)</label>
-      <input id="stGalaxyReward" type="number" step="0.1" value="${s.galaxy_reward_amount}">
-      <label class="f">Daily Limit per User</label>
-      <input id="stGalaxyDaily" type="number" value="${s.galaxy_daily_limit}">
-      <label class="f">Cooldown Between Ads (seconds)</label>
-      <input id="stGalaxyCooldown" type="number" value="${s.galaxy_cooldown_seconds}">
+      <label class="f">Batch Size (e.g. 6 = every 6 referrals)</label>
+      <input id="stRefSkipBatch" type="number" min="2" value="${s.referral_skip_batch_size}">
+      <label class="f">Min Skipped per Batch</label>
+      <input id="stRefSkipMin" type="number" min="0" value="${s.referral_skip_min}">
+      <label class="f">Max Skipped per Batch</label>
+      <input id="stRefSkipMax" type="number" min="0" value="${s.referral_skip_max}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
+    <h2 class="sect">User Self-Serve Tasks (promote own channel)</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        Lets any user pay from their own balance to advertise their own
+        channel as a task. Submissions need your approval before going live
+        (see the "Tasks" tab for pending review).
+      </div>
+      <label class="f">Enabled</label>
+      <select id="stUtcEnabled">
+        <option value="0" ${!s.user_task_creation_enabled ? "selected" : ""}>Off</option>
+        <option value="1" ${s.user_task_creation_enabled ? "selected" : ""}>On</option>
+      </select>
+      <label class="f">Min Reward per Person (Birr)</label>
+      <input id="stUtcMinReward" type="number" step="0.1" value="${s.user_task_min_reward}">
+      <label class="f">Max Reward per Person (Birr)</label>
+      <input id="stUtcMaxReward" type="number" step="0.1" value="${s.user_task_max_reward}">
+      <label class="f">Min People per Task</label>
+      <input id="stUtcMinSlots" type="number" value="${s.user_task_min_slots}">
+      <label class="f">Max People per Task</label>
+      <input id="stUtcMaxSlots" type="number" value="${s.user_task_max_slots}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
   `;
@@ -1515,18 +1701,26 @@ async function saveSettings(){
   const direct_link_daily_limit = parseInt(document.getElementById("stAdDlDaily").value, 10);
   const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
   const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
-  const galaxy_ads_enabled = document.getElementById("stGalaxyEnabled").value === "1";
-  const adsgalaxy_miniapp_id = document.getElementById("stGalaxyMiniappId").value.trim();
-  const galaxy_reward_amount = parseFloat(document.getElementById("stGalaxyReward").value);
-  const galaxy_daily_limit = parseInt(document.getElementById("stGalaxyDaily").value, 10);
-  const galaxy_cooldown_seconds = parseInt(document.getElementById("stGalaxyCooldown").value, 10);
+  const monetag_sdk_url = document.getElementById("stMonetagUrl").value.trim();
+  const monetag_zone_id = document.getElementById("stMonetagZone").value.trim();
+  const referral_skip_enabled = document.getElementById("stRefSkipEnabled").value === "1";
+  const referral_skip_batch_size = parseInt(document.getElementById("stRefSkipBatch").value, 10);
+  const referral_skip_min = parseInt(document.getElementById("stRefSkipMin").value, 10);
+  const referral_skip_max = parseInt(document.getElementById("stRefSkipMax").value, 10);
+  const user_task_creation_enabled = document.getElementById("stUtcEnabled").value === "1";
+  const user_task_min_reward = parseFloat(document.getElementById("stUtcMinReward").value);
+  const user_task_max_reward = parseFloat(document.getElementById("stUtcMaxReward").value);
+  const user_task_min_slots = parseInt(document.getElementById("stUtcMinSlots").value, 10);
+  const user_task_max_slots = parseInt(document.getElementById("stUtcMaxSlots").value, 10);
   await api("/api/admin/settings/update", {
     reward_per_referral, min_withdrawal, support_username,
     ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
     adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
     direct_link_wait_seconds, direct_link_cooldown_seconds,
-    galaxy_ads_enabled, adsgalaxy_miniapp_id, galaxy_reward_amount,
-    galaxy_daily_limit, galaxy_cooldown_seconds,
+    monetag_sdk_url, monetag_zone_id,
+    referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
+    user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
+    user_task_min_slots, user_task_max_slots,
   });
   toast("✅ Settings saved");
   refreshMe();
@@ -1547,31 +1741,11 @@ async function checkAdsgramConnection(){
         ${row(r.block_id_configured, "Block ID configured (rewarded video)")}
         ${row(r.direct_link_configured, "Direct Link URL configured")}
         ${row(r.direct_link_valid_url, "Direct Link URL looks valid")}
+        ${row(r.monetag_configured, "Monetag zone/URL configured (fallback)")}
         <div style="margin-top:8px;font-weight:700;font-size:.82rem">
           ${r.video_ready ? "✅ Rewarded video is live" : "⚠️ Rewarded video not fully configured"}<br>
-          ${r.direct_link_ready ? "✅ Direct Link is live" : "⚠️ Direct Link not fully configured"}
-        </div>
-      </div>`;
-  } catch (e){
-    box.innerHTML = `<div class="empty">Couldn't run the check.</div>`;
-  }
-}
-async function checkGalaxyConnection(){
-  const box = document.getElementById("galaxyCheckResult");
-  box.innerHTML = `<div class="mini" style="padding:8px 2px">Checking…</div>`;
-  try {
-    const r = await api("/api/admin/ads/verify");
-    const row = (ok, label) => `
-      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
-        <span>${ok ? "✅" : "❌"}</span><span class="mini">${label}</span>
-      </div>`;
-    box.innerHTML = `
-      <div class="card" style="padding:12px 14px;">
-        ${row(r.galaxy_sdk_script_present, "AdsGalaxy SDK script loaded in Mini App")}
-        ${row(r.galaxy_enabled, "AdsGalaxy enabled in settings")}
-        ${row(r.galaxy_miniapp_id_configured, "Mini App ID configured")}
-        <div style="margin-top:8px;font-weight:700;font-size:.82rem">
-          ${r.galaxy_ready ? "✅ Watch Ads is live" : "⚠️ Watch Ads not fully configured"}
+          ${r.direct_link_ready ? "✅ Direct Link is live" : "⚠️ Direct Link not fully configured"}<br>
+          ${r.monetag_ready ? "✅ Monetag fallback is live" : "⚠️ Monetag fallback not configured (optional)"}
         </div>
       </div>`;
   } catch (e){
