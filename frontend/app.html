@@ -982,6 +982,7 @@ function openCreateTaskPage(){
 // Carried from step 1 into step 2/submit. Empty channel = unverified/"fake".
 let _ctVerifiedChannel = "";
 let _ctInviteLink = "";
+let _ctTitle = "";
 
 // Accepts @username, a bare username, or a https://t.me/... link and
 // figures out the public username (if any) plus a clean invite link.
@@ -1003,6 +1004,13 @@ function parseChannelInput(raw){
   return { username, chatId: `@${username}`, inviteLink: `https://t.me/${username}`, isPrivate: false };
 }
 
+// If the real channel name is too long to sit nicely in a task-card
+// label, fall back to a short generic caption instead of overflowing it.
+function ctDisplayTitle(title){
+  if (!title) return "Join Channel";
+  return title.length > 28 ? "Join Channel" : title;
+}
+
 function renderCtStep1(){
   const wrap = document.getElementById("createTaskForm");
   const botTag = UTC.bot_username ? `@${escapeHtml(UTC.bot_username)}` : "the bot";
@@ -1010,12 +1018,13 @@ function renderCtStep1(){
     <div class="mini">
       To let us verify people actually joined, add ${botTag} as an <b>Admin</b>
       in your channel. Then enter your channel's username or link below —
-      just like joining it yourself, no ID needed.
+      just like joining it yourself, no ID needed. We'll pick up the
+      channel name automatically.
     </div>
     <label class="f">Channel Username or Link</label>
     <input id="ctChannel" placeholder="@yourchannel or https://t.me/yourchannel">
     <button class="btn gold" id="ctCheckBtn" onclick="checkCtAdmin()">🔄 I've Added the Bot — Check</button>
-    <button class="btn ghost" onclick="skipCtVerify()">Skip verification (unverified task)</button>
+    <button class="btn ghost" id="ctSkipBtn" onclick="skipCtVerify()">Skip verification (unverified task)</button>
   `;
 }
 
@@ -1035,6 +1044,7 @@ async function checkCtAdmin(){
       tg?.HapticFeedback?.notificationOccurred("success");
       _ctVerifiedChannel = parsed.chatId;
       _ctInviteLink = parsed.inviteLink;
+      _ctTitle = (r.title || parsed.username || "").trim();
       renderCtStep2(true);
     } else {
       toast("❌ Bot isn't an admin there yet — add it, then tap Check again");
@@ -1048,29 +1058,46 @@ async function checkCtAdmin(){
   }
 }
 
-function skipCtVerify(){
+async function skipCtVerify(){
   const raw = document.getElementById("ctChannel").value.trim();
   const parsed = parseChannelInput(raw);
   if (!parsed || !parsed.inviteLink) return toast("❌ Enter your channel username or link first");
+  const btn = document.getElementById("ctSkipBtn");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin-ico"></span> Loading…`;
   _ctVerifiedChannel = "";
   _ctInviteLink = parsed.inviteLink;
+  _ctTitle = parsed.username || "";
+  // Best-effort name lookup even when skipping verification — public
+  // channels can still be looked up without the bot being an admin.
+  if (parsed.chatId){
+    try {
+      const r = await api("/api/tasks/verify_admin", { channel_id: parsed.chatId });
+      if (r.title) _ctTitle = r.title.trim();
+    } catch (e) { /* ignore — we'll just use the username as the title */ }
+  }
   renderCtStep2(false);
 }
 
 function renderCtStep2(verified){
   const wrap = document.getElementById("createTaskForm");
+  const shownTitle = ctDisplayTitle(_ctTitle);
   wrap.innerHTML = `
     <div class="mini">
       ${verified ? "✅ Verified — this will be a real, membership-checked task."
                  : "⚠️ Unverified — this will be a wait-timer-only task (no real join check)."}
     </div>
-    <label class="f">Channel Title</label>
-    <input id="ctTitle" placeholder="e.g. My News Channel">
+    <div class="mini" style="font-weight:700;color:#e8e8e8">📢 ${escapeHtml(shownTitle)}</div>
     <label class="f">Reward per Person (Birr, ${UTC.min_reward}–${UTC.max_reward})</label>
     <input id="ctReward" type="number" step="0.1" min="${UTC.min_reward}" max="${UTC.max_reward}" oninput="updateCtCost()">
     <label class="f">Number of People (${UTC.min_slots}–${UTC.max_slots})</label>
     <input id="ctSlots" type="number" min="${UTC.min_slots}" max="${UTC.max_slots}" oninput="updateCtCost()">
     <div class="mini" id="ctCost">Total cost: 0.00 Birr</div>
+    <div class="mini" id="ctLowBalanceHint" style="display:none;color:#ff9d5c">
+      Not enough balance for this? ${ME?.support_username
+        ? `<a href="javascript:void(0)" onclick="openSupport()" style="color:#ffb300">Contact admin to top up your funds</a>`
+        : "Contact the admin to top up your funds."}
+    </div>
     <button class="btn gold" id="ctSubmitBtn" onclick="submitCreateTask()">Submit for Review</button>
   `;
 }
@@ -1078,15 +1105,17 @@ function renderCtStep2(verified){
 function updateCtCost(){
   const r = parseFloat(document.getElementById("ctReward")?.value) || 0;
   const s = parseInt(document.getElementById("ctSlots")?.value, 10) || 0;
+  const total = r * s;
   const el = document.getElementById("ctCost");
-  if (el) el.textContent = `Total cost: ${fmt(r * s)} Birr (deducted from your balance now)`;
+  if (el) el.textContent = `Total cost: ${fmt(total)} Birr (deducted from your balance now)`;
+  const hint = document.getElementById("ctLowBalanceHint");
+  if (hint) hint.style.display = (total > 0 && total > (ME?.balance || 0)) ? "block" : "none";
 }
 
 async function submitCreateTask(){
-  const title = document.getElementById("ctTitle").value.trim();
   const reward = parseFloat(document.getElementById("ctReward").value);
   const budget_slots = parseInt(document.getElementById("ctSlots").value, 10);
-  if (!title || !_ctInviteLink || !reward || !budget_slots){
+  if (!_ctTitle || !_ctInviteLink || !reward || !budget_slots){
     return toast("❌ Please fill in every field");
   }
   const btn = document.getElementById("ctSubmitBtn");
@@ -1094,7 +1123,7 @@ async function submitCreateTask(){
   btn.innerHTML = `<span class="spin-ico"></span> Submitting…`;
   try {
     await api("/api/tasks/create", {
-      title, invite_link: _ctInviteLink, reward, budget_slots, channel_id: _ctVerifiedChannel,
+      title: _ctTitle, invite_link: _ctInviteLink, reward, budget_slots, channel_id: _ctVerifiedChannel,
     });
     tg?.HapticFeedback?.notificationOccurred("success");
     toast("✅ Submitted — waiting for admin approval");
@@ -1106,6 +1135,10 @@ async function submitCreateTask(){
               : e.message === "invalid_link"        ? "❌ Please use a valid t.me channel"
               : "❌ Couldn't submit — try again";
     toast(msg);
+    if (e.message === "insufficient_balance"){
+      const hint = document.getElementById("ctLowBalanceHint");
+      if (hint) hint.style.display = "block";
+    }
     btn.disabled = false;
     btn.innerHTML = "Submit for Review";
   }
