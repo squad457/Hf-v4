@@ -1224,7 +1224,7 @@ async function renderInvite(view){
         <input readonly id="refLink" value="${ME.referral_link}">
         <button class="btn sm" style="width:auto;padding:11px 16px;" onclick="copyLink()">Copy</button>
       </div>
-      <button class="btn gold" style="margin-top:10px" onclick="shareLink()">📤 Share with Friends</button>
+      <button class="btn gold" id="shareLinkBtn" style="margin-top:10px" onclick="shareLink()">📤 Share with Friends</button>
     </div>
     <h2 class="sect">Network</h2>
     <div class="card stat-row" style="margin-bottom:0">
@@ -1240,9 +1240,24 @@ function copyLink(){
   navigator.clipboard?.writeText(el.value).catch(()=>{});
   toast("🔗 Link copied!");
 }
-function shareLink(){
-  const url = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent("Join and earn rewards! 🎁")}`;
-  tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, "_blank");
+async function shareLink(){
+  const btn = document.getElementById("shareLinkBtn");
+  if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
+  try {
+    await api("/api/invite/share_card", {});
+    tg?.HapticFeedback?.notificationOccurred("success");
+    toast("📤 Sent to your chat with the bot — long-press it and tap Forward!");
+    // Jump them straight to the bot chat so the message is right there to forward.
+    const uname = ME?.referral_link?.match(/t\.me\/([^?]+)/)?.[1];
+    if (uname){
+      const url = `https://t.me/${uname}`;
+      tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, "_blank");
+    }
+  } catch (e){
+    toast("⚠️ Couldn't prepare the invite — try again");
+  } finally {
+    if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════
