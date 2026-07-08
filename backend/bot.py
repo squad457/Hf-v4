@@ -3135,7 +3135,16 @@ async def api_tasks_claim(body: TaskActionRequest):
     # creator already paid for at creation time — the reward above came
     # from that escrow, not from a fresh mint of balance.
     if task["created_by"]:
-        await DataEngine.increment_task_slot(body.task_id)
+        sold_out = await DataEngine.increment_task_slot(body.task_id)
+        if sold_out:
+            try:
+                await bot.send_message(
+                    task["created_by"],
+                    f"🎯 Your task \"{task['title']}\" has reached its target — "
+                    f"all {task['budget_slots']} people have joined. It's now removed from the task list."
+                )
+            except Exception:
+                pass
     fresh = await DataEngine.get_user(uid)
     return {"status": "completed", "reward": float(task["reward"]), "balance": float(fresh["balance"])}
 
@@ -3175,7 +3184,15 @@ async def api_tasks_verify_admin(body: VerifyAdminRequest):
     except Exception:
         # Channel not found, bot not in it at all, wrong ID format, etc.
         is_admin = False
-    return {"is_admin": is_admin, "bot_username": BOT_USERNAME}
+    # Best-effort — works for any public channel regardless of admin
+    # status, so the user never has to type the channel name themselves.
+    title = None
+    try:
+        chat = await bot.get_chat(chat_id=channel_id)
+        title = (chat.title or "").strip() or None
+    except Exception:
+        pass
+    return {"is_admin": is_admin, "bot_username": BOT_USERNAME, "title": title}
 
 
 @api_app.post("/api/tasks/create")
@@ -3186,7 +3203,7 @@ async def api_tasks_create(body: UserTaskCreateRequest):
     if (await DataEngine.get_setting("user_task_creation_enabled", "0")) != "1":
         raise HTTPException(status_code=400, detail="feature_disabled")
 
-    title = body.title.strip()
+    title = body.title.strip()[:80]
     link = body.invite_link.strip()
     channel_id = body.channel_id.strip()
     if not title or not link:
