@@ -322,6 +322,13 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_daily_limit', '
 INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_wait_seconds', '15');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_cooldown_seconds', '30');
 
+-- AdsGalaxy — rewarded ad (new provider, shown front-and-center on the Tasks tab)
+INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_ads_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgalaxy_miniapp_id', '5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_reward_amount', '0.5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_daily_limit', '10');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('galaxy_cooldown_seconds', '30');
+
 INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
 """
@@ -2726,9 +2733,10 @@ async def api_gate_fake_seen(body: ApiBase):
     return {"ok": True}
 
 
-# ── /api/ads/* — AdsGram rewarded video + Direct Link ────────────────────
+# ── /api/ads/* — AdsGram rewarded video + Direct Link + AdsGalaxy ────────
 AD_KIND_VIDEO  = "video"
 AD_KIND_DIRECT = "direct_link"
+AD_KIND_GALAXY = "galaxy"
 
 
 class AdClickRequest(ApiBase):
@@ -2742,7 +2750,7 @@ async def api_ads_click(body: AdClickRequest):
     the admin 'clicks vs completions' dashboard; never affects rewards
     or daily limits."""
     user = await _authenticate(body)
-    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT) else AD_KIND_VIDEO
+    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT, AD_KIND_GALAXY) else AD_KIND_VIDEO
     await DataEngine.log_ad_click(user["user_id"], kind)
     return {"ok": True}
 
@@ -2783,6 +2791,21 @@ async def api_ads_status(body: ApiBase):
         except Exception:
             pass
 
+    galaxy_enabled          = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
+    galaxy_miniapp_id       = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "").strip()
+    galaxy_reward           = float(await DataEngine.get_setting("galaxy_reward_amount", "0.5"))
+    galaxy_daily_limit      = int(await DataEngine.get_setting("galaxy_daily_limit", "10"))
+    galaxy_cooldown_seconds = int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30"))
+    galaxy_watched_today    = await DataEngine.count_ad_events_today(uid, AD_KIND_GALAXY)
+    galaxy_seconds_left = 0
+    galaxy_last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_GALAXY)
+    if galaxy_last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(galaxy_last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            galaxy_seconds_left = max(0, int(galaxy_cooldown_seconds - elapsed))
+        except Exception:
+            pass
+
     return {
         "enabled": ads_enabled and bool(block_id),
         "block_id": block_id,
@@ -2798,6 +2821,14 @@ async def api_ads_status(body: ApiBase):
             "watched_today": dl_watched_today,
             "seconds_left": dl_seconds_left,
             "wait_seconds": dl_wait_seconds,
+        },
+        "galaxy": {
+            "enabled": galaxy_enabled and bool(galaxy_miniapp_id),
+            "miniapp_id": galaxy_miniapp_id,
+            "reward_amount": galaxy_reward,
+            "daily_limit": galaxy_daily_limit,
+            "watched_today": galaxy_watched_today,
+            "seconds_left": galaxy_seconds_left,
         },
     }
 
@@ -2839,6 +2870,45 @@ async def api_ads_claim(body: ApiBase):
     await DataEngine.record_ad_event(uid, AD_KIND_VIDEO, reward_amount)
     await DataEngine.add_balance(uid, reward_amount)
     return {"credited": reward_amount}
+
+
+@api_app.post("/api/ads/galaxy/claim")
+async def api_ads_galaxy_claim(body: ApiBase):
+    """AdsGalaxy rewarded ad — same trust model as the AdsGram rewarded
+    video claim above: the frontend only calls this after the AdsGalaxy
+    SDK call resolves, and we re-check the daily cap / cooldown here
+    server-side before paying anything out."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    galaxy_enabled = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
+    miniapp_id = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "").strip()
+    if not galaxy_enabled or not miniapp_id:
+        raise HTTPException(status_code=400, detail="ads_disabled")
+
+    daily_limit      = int(await DataEngine.get_setting("galaxy_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30"))
+    reward_amount    = float(await DataEngine.get_setting("galaxy_reward_amount", "0.5"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_GALAXY)
+    if watched_today >= daily_limit:
+        raise HTTPException(status_code=400, detail="daily_limit_reached")
+
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_GALAXY)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HTTPException(status_code=400, detail="cooldown_active")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    await DataEngine.record_ad_event(uid, AD_KIND_GALAXY, reward_amount)
+    await DataEngine.add_balance(uid, reward_amount)
+    fresh = await DataEngine.get_user(uid)
+    return {"credited": reward_amount, "balance": float(fresh["balance"])}
 
 
 @api_app.post("/api/ads/direct-link/open")
@@ -3299,6 +3369,12 @@ async def api_admin_settings(body: ApiBase):
         "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
         "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
         "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+        # AdsGalaxy — rewarded ad (Tasks tab)
+        "galaxy_ads_enabled": (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1",
+        "adsgalaxy_miniapp_id": await DataEngine.get_setting("adsgalaxy_miniapp_id", "5") or "",
+        "galaxy_reward_amount": float(await DataEngine.get_setting("galaxy_reward_amount", "0.5")),
+        "galaxy_daily_limit": int(await DataEngine.get_setting("galaxy_daily_limit", "10")),
+        "galaxy_cooldown_seconds": int(await DataEngine.get_setting("galaxy_cooldown_seconds", "30")),
         # Support contact — shown as a floating support button in the dashboard
         "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
@@ -3317,6 +3393,11 @@ class AdminSettingsUpdateRequest(ApiBase):
     direct_link_daily_limit: int = 10
     direct_link_wait_seconds: int = 15
     direct_link_cooldown_seconds: int = 30
+    galaxy_ads_enabled: bool = False
+    adsgalaxy_miniapp_id: str = "5"
+    galaxy_reward_amount: float = 0.5
+    galaxy_daily_limit: int = 10
+    galaxy_cooldown_seconds: int = 30
     support_username: str = ""
 
 
@@ -3336,6 +3417,11 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("direct_link_daily_limit", str(body.direct_link_daily_limit))
     await DataEngine.set_setting("direct_link_wait_seconds", str(body.direct_link_wait_seconds))
     await DataEngine.set_setting("direct_link_cooldown_seconds", str(body.direct_link_cooldown_seconds))
+    await DataEngine.set_setting("galaxy_ads_enabled", "1" if body.galaxy_ads_enabled else "0")
+    await DataEngine.set_setting("adsgalaxy_miniapp_id", body.adsgalaxy_miniapp_id.strip())
+    await DataEngine.set_setting("galaxy_reward_amount", str(body.galaxy_reward_amount))
+    await DataEngine.set_setting("galaxy_daily_limit", str(body.galaxy_daily_limit))
+    await DataEngine.set_setting("galaxy_cooldown_seconds", str(body.galaxy_cooldown_seconds))
     await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     return {"ok": True}
 
@@ -3350,6 +3436,9 @@ async def api_admin_ads_verify(body: ApiBase):
     ads_enabled  = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
     video_ready  = ads_enabled and bool(block_id)
     link_ready   = ads_enabled and direct_link.lower().startswith(("http://", "https://"))
+    galaxy_id      = (await DataEngine.get_setting("adsgalaxy_miniapp_id", "") or "").strip()
+    galaxy_enabled = (await DataEngine.get_setting("galaxy_ads_enabled", "0")) == "1"
+    galaxy_ready   = galaxy_enabled and bool(galaxy_id)
     return {
         "sdk_script_present": True,  # sad.min.js is loaded in frontend/app.html <head>
         "ads_enabled": ads_enabled,
@@ -3358,6 +3447,10 @@ async def api_admin_ads_verify(body: ApiBase):
         "direct_link_valid_url": link_ready,
         "video_ready": video_ready,
         "direct_link_ready": link_ready,
+        "galaxy_sdk_script_present": True,  # AdsGalaxy sdk.js is loaded in frontend/app.html <head>
+        "galaxy_enabled": galaxy_enabled,
+        "galaxy_miniapp_id_configured": bool(galaxy_id),
+        "galaxy_ready": galaxy_ready,
     }
 
 
