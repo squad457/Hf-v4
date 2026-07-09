@@ -2878,10 +2878,26 @@ async def api_me(body: ApiBase):
 #    message (bot's photo + a written invite caption + an inline button
 #    holding their referral link) in their own chat with the bot, so they
 #    can just long-press → Forward it straight to friends. ────────────────
+SHARE_CARD_COOLDOWN_SECONDS = 25 * 60
+
+
 @api_app.post("/api/invite/share_card")
 async def api_invite_share_card(body: ApiBase):
     user = await _authenticate(body)
     uid = user["user_id"]
+
+    last_at = await DataEngine.get_last_ad_event(uid, "share_card")
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            remaining = int(SHARE_CARD_COOLDOWN_SECONDS - elapsed)
+            if remaining > 0:
+                raise HTTPException(status_code=400, detail=f"cooldown:{remaining}")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # bad timestamp format — don't block the user over it
+
     caption, kb, photo_id = await _build_invite_card(uid)
     try:
         if photo_id:
@@ -2890,6 +2906,7 @@ async def api_invite_share_card(body: ApiBase):
             await bot.send_message(chat_id=uid, text=caption, reply_markup=kb)
     except Exception:
         raise HTTPException(status_code=503, detail="send_failed")
+    await DataEngine.record_ad_event(uid, "share_card", 0)
     return {"ok": True}
 
 
