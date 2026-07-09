@@ -1091,8 +1091,7 @@ function renderCtStep2(verified){
   const shownTitle = ctDisplayTitle(_ctTitle);
   wrap.innerHTML = `
     <div class="mini">
-      ${verified ? "✅ Verified — this will be a real, membership-checked task."
-                 : "⚠️ Unverified — this will be a wait-timer-only task (no real join check)."}
+      ${verified ? "✅ Verified" : "⚠️ Unverified"}
     </div>
     <div class="mini" style="font-weight:700;color:#e8e8e8">📢 ${escapeHtml(shownTitle)}</div>
     <label class="f">Reward per Person (Birr, ${UTC.min_reward}–${UTC.max_reward})</label>
@@ -1243,21 +1242,22 @@ function copyLink(){
 async function shareLink(){
   const btn = document.getElementById("shareLinkBtn");
   if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
-  try {
-    await api("/api/invite/share_card", {});
-    tg?.HapticFeedback?.notificationOccurred("success");
-    toast("📤 Sent to your chat with the bot — long-press it and tap Forward!");
-    // Jump them straight to the bot chat so the message is right there to forward.
-    const uname = ME?.referral_link?.match(/t\.me\/([^?]+)/)?.[1];
-    if (uname){
-      const url = `https://t.me/${uname}`;
-      tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, "_blank");
-    }
-  } catch (e){
-    toast("⚠️ Couldn't prepare the invite — try again");
-  } finally {
-    if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
-  }
+
+  // 1) Send the nice forwardable card (photo + button) to their own chat
+  //    with the bot, in case they want to manually long-press → Forward
+  //    that exact rich version later.
+  api("/api/invite/share_card", {}).catch(() => {});
+
+  // 2) Telegram's Bot API has no way to auto-open the "Forward" picker for
+  //    an already-sent message — only the person long-pressing a message
+  //    can do that. The only chat-picker Telegram lets us open directly is
+  //    this share-url one, so we use it to reproduce the same "pick a
+  //    friend, tap send" flow as before, with our text pre-filled.
+  const text = "🎉 I'm earning real money with this bot — join and start earning too! 🎁";
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
+  tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
+
+  if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
 }
 
 /* ══════════════════════════════════════════════════════════════════
