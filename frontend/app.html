@@ -1243,12 +1243,26 @@ async function shareLink(){
   const btn = document.getElementById("shareLinkBtn");
   if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
 
-  // switchInlineQuery opens Telegram's native "choose a chat" picker and,
-  // once the user picks someone, has the BOT deliver the message directly
-  // into that chat — photo + inline "Join" button included. A manual
-  // Forward of a bot message strips its buttons, so this inline-mode
-  // route (what most invite/referral bots actually use) is what keeps
-  // everything intact, not just plain forwarding.
+  // Two ways to share, offered together:
+  // 1) Send the card straight into the bot chat too — handy if they'd
+  //    rather forward it themselves, or share it outside Telegram's
+  //    picker. Rate-limited server-side (25 min) so this can't be spammed.
+  api("/api/invite/share_card", {})
+    .then(() => toast("💬 Also sent to your chat with the bot"))
+    .catch((e) => {
+      if (e.message?.startsWith("cooldown:")){
+        const mins = Math.ceil(parseInt(e.message.split(":")[1], 10) / 60);
+        toast(`💬 You can resend it in your bot chat in ~${mins} min`);
+      }
+      // any other failure here is silent — the picker flow below still works
+    });
+
+  // 2) switchInlineQuery opens Telegram's native "choose a chat" picker
+  //    and, once picked, has the BOT deliver the message directly into
+  //    that chat — photo + inline "Join" button included. A manual
+  //    Forward of a bot message strips its buttons, so this inline-mode
+  //    route (what most invite/referral bots actually use) is what keeps
+  //    everything intact, not just plain forwarding.
   if (tg?.switchInlineQuery){
     tg.switchInlineQuery("invite", ["users", "groups", "channels"]);
   } else {
