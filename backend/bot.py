@@ -3872,6 +3872,14 @@ async def _main():
         BOT_ID = me.id
     except Exception as e:
         logger.warning(f"Could not fetch bot identity at startup: {e}")
+    # Pre-warm the invite-card photo cache so the very first time someone
+    # taps "Share with Friends", Telegram's inline query gets answered
+    # instantly instead of waiting on a first-time get_user_profile_photos
+    # round-trip (which is what made it feel like a slow "search").
+    try:
+        await _get_bot_photo_file_id()
+    except Exception as e:
+        logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     asyncio.create_task(db_backup_loop())
     await _run_web_server()
