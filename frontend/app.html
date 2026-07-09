@@ -1589,7 +1589,8 @@ async function adminWithdrawals(body){
             <div class="mini">UID ${w.user_id} · ${escapeHtml(w.phone)}</div>
           </div>
           <div style="display:flex;gap:5px;flex-shrink:0">
-            <button class="btn sm ghost" style="width:auto;background:rgba(200,242,77,.15);color:var(--lime)" onclick="approveWd(${w.id})">✓</button>
+            <button class="btn sm ghost" style="width:auto;background:rgba(200,242,77,.15);color:var(--lime)" onclick="approveWd(${w.id},'both')" title="Approve — notify user + channel">✓ Both</button>
+            <button class="btn sm ghost" style="width:auto;background:rgba(47,141,250,.15);color:#2f8dfa" onclick="approveWd(${w.id},'channel_only')" title="Approve — channel only, no DM to user">📢</button>
             <button class="btn sm danger" style="width:auto" onclick="rejectWd(${w.id})">✕</button>
           </div>
         </div>
@@ -1597,9 +1598,9 @@ async function adminWithdrawals(body){
     </div>
   `;
 }
-async function approveWd(id){
-  await api("/api/admin/withdrawals/approve", { id });
-  toast("✅ Completed ");
+async function approveWd(id, notify_mode = "both"){
+  await api("/api/admin/withdrawals/approve", { id, notify_mode });
+  toast(notify_mode === "channel_only" ? "✅ Completed — channel only" : "✅ Completed — user notified");
   paintAdminBody();
 }
 async function rejectWd(id){
