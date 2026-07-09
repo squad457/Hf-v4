@@ -34,7 +34,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo, FSInputFile
+    WebAppInfo, FSInputFile, InlineQuery, InlineQueryResultCachedPhoto,
+    InlineQueryResultArticle, InputTextMessageContent
 )
 
 from fastapi import FastAPI, Request, HTTPException
@@ -1309,6 +1310,76 @@ class AdminConsoleWorkflow(StatesGroup):
 bot         = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp          = Dispatcher(storage=MemoryStorage())
 core_router = Router()
+
+# ── Shared "invite card" builder — used both by /api/invite/share_card
+#    (sends it straight into the user's own chat with the bot) and by the
+#    inline_query handler below (lets the user pick a friend/group from
+#    Telegram's native chat list and have it delivered there directly).
+_bot_photo_file_id: str | None = None  # cached after first lookup
+
+
+async def _get_bot_photo_file_id() -> str | None:
+    global _bot_photo_file_id
+    if _bot_photo_file_id:
+        return _bot_photo_file_id
+    try:
+        photos = await bot.get_user_profile_photos(BOT_ID or (await bot.get_me()).id, limit=1)
+        if photos.total_count > 0:
+            _bot_photo_file_id = photos.photos[0][-1].file_id  # largest size
+    except Exception:
+        pass
+    return _bot_photo_file_id
+
+
+async def _build_invite_card(uid: int):
+    uname = BOT_USERNAME or (await bot.get_me()).username
+    referral_link = f"https://t.me/{uname}?start={uid}"
+    caption = (
+        "🎉 <b>I'm earning real money with this bot — and you can too!</b>\n\n"
+        "✅ Complete simple tasks\n"
+        "✅ Watch short ads\n"
+        "✅ Invite friends for bonus rewards\n"
+        "✅ Withdraw straight to Telebirr\n\n"
+        "Tap the button below to join — it only takes a minute 👇"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Join & Start Earning", url=referral_link)],
+    ])
+    photo_id = await _get_bot_photo_file_id()
+    return caption, kb, photo_id
+
+
+@core_router.inline_query()
+async def handle_invite_inline_query(inline_query: InlineQuery):
+    """
+    Powers "Share with Friends": the Mini App calls tg.switchInlineQuery(),
+    the user picks a friend/group from Telegram's native chat picker, and
+    Telegram calls this handler to ask what to actually send there.
+
+    This matters because a manually-forwarded copy of a bot message loses
+    its inline keyboard — Telegram only keeps buttons on messages sent
+    live by the bot. Answering an inline query IS the bot sending the
+    message directly into that chat (just triggered through the picker
+    instead of a /start), so the photo + button both survive. This is the
+    same mechanism most invite/referral bots rely on for exactly that reason.
+    """
+    caption, kb, photo_id = await _build_invite_card(inline_query.from_user.id)
+    if photo_id:
+        result = InlineQueryResultCachedPhoto(
+            id=str(inline_query.from_user.id), photo_file_id=photo_id,
+            caption=caption, reply_markup=kb,
+        )
+    else:
+        result = InlineQueryResultArticle(
+            id=str(inline_query.from_user.id), title="📤 Share your invite",
+            description="Tap to send your invite card with a Join button",
+            input_message_content=InputTextMessageContent(message_text=caption),
+            reply_markup=kb,
+        )
+    try:
+        await bot.answer_inline_query(inline_query.id, results=[result], cache_time=0, is_personal=True)
+    except Exception as e:
+        logger.warning(f"answer_inline_query failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEBUG: catch-all callback logger
@@ -2807,42 +2878,11 @@ async def api_me(body: ApiBase):
 #    message (bot's photo + a written invite caption + an inline button
 #    holding their referral link) in their own chat with the bot, so they
 #    can just long-press → Forward it straight to friends. ────────────────
-_bot_photo_file_id: str | None = None  # cached after first lookup
-
-
-async def _get_bot_photo_file_id() -> str | None:
-    global _bot_photo_file_id
-    if _bot_photo_file_id:
-        return _bot_photo_file_id
-    try:
-        photos = await bot.get_user_profile_photos(BOT_ID or (await bot.get_me()).id, limit=1)
-        if photos.total_count > 0:
-            _bot_photo_file_id = photos.photos[0][-1].file_id  # largest size
-    except Exception:
-        pass
-    return _bot_photo_file_id
-
-
 @api_app.post("/api/invite/share_card")
 async def api_invite_share_card(body: ApiBase):
     user = await _authenticate(body)
     uid = user["user_id"]
-    uname = BOT_USERNAME or (await bot.get_me()).username
-    referral_link = f"https://t.me/{uname}?start={uid}"
-
-    caption = (
-        "🎉 <b>I'm earning real money with this bot — and you can too!</b>\n\n"
-        "✅ Complete simple tasks\n"
-        "✅ Watch short ads\n"
-        "✅ Invite friends for bonus rewards\n"
-        "✅ Withdraw straight to Telebirr\n\n"
-        "Tap the button below to join — it only takes a minute 👇"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Join & Start Earning", url=referral_link)],
-    ])
-
-    photo_id = await _get_bot_photo_file_id()
+    caption, kb, photo_id = await _build_invite_card(uid)
     try:
         if photo_id:
             await bot.send_photo(chat_id=uid, photo=photo_id, caption=caption, reply_markup=kb)
