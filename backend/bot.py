@@ -1914,7 +1914,12 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve (ይለቀቅ)",  callback_data=f"adm_payout_ap_{tid}"),
+            InlineKeyboardButton(text="✅ Approve (Both)",  callback_data=f"adm_payout_ap_{tid}"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Approve (Channel Only)", callback_data=f"adm_payout_apco_{tid}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Deny (ውድቅ አድርግ)", callback_data=f"adm_payout_rjmenu_{tid}"),
         ],
         [InlineKeyboardButton(text="👥 View Referrals", callback_data=f"adm_view_invites_{uid}")]
@@ -2006,12 +2011,16 @@ async def process_fraud_log(callback: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — APPROVE WITHDRAWAL
 # ─────────────────────────────────────────────────────────────────────────────
-async def approve_withdrawal_core(tid: int) -> dict:
+async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
     """
     Shared approval logic used by BOTH the bot-chat inline button and the
     Mini App REST endpoint (/api/admin/withdrawals/approve), so there's
     exactly one place that posts the Telebirr proof photo and notifies
     the user.
+
+    notify_mode:
+      "both"          — post proof to the channel AND DM the user (default)
+      "channel_only"  — post proof to the channel only, no DM to the user
     """
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending":
@@ -2050,13 +2059,14 @@ async def approve_withdrawal_core(tid: int) -> dict:
                 )
             except Exception as e2:
                 logger.error(f"Proof Text Fallback Error: {e2}")
-    try:
-        await bot.send_message(
-            ticket["user_id"],
-            f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
-        )
-    except Exception:
-        pass
+    if notify_mode != "channel_only":
+        try:
+            await bot.send_message(
+                ticket["user_id"],
+                f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
+            )
+        except Exception:
+            pass
     return {"ok": True}
 
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
@@ -2064,10 +2074,23 @@ async def process_admin_approval(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id):
         return
     tid    = int(callback.data.split("_")[3])
-    result = await approve_withdrawal_core(tid)
+    result = await approve_withdrawal_core(tid, notify_mode="both")
     if not result["ok"]:
         return await callback.answer("Already processed.")
-    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved (Both notified).")
+    await callback.answer()
+
+
+@core_router.callback_query(F.data.startswith("adm_payout_apco_"))
+async def process_admin_approval_channel_only(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id):
+        return
+    tid    = int(callback.data.split("_")[3])
+    result = await approve_withdrawal_core(tid, notify_mode="channel_only")
+    if not result["ok"]:
+        return await callback.answer("Already processed.")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved (Channel only — user not DMed).")
+    await callback.answer()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — REJECT WITHDRAWAL
@@ -3619,11 +3642,17 @@ async def api_admin_withdrawals_list(body: ApiBase):
     return {"withdrawals": [dict(r) for r in rows]}
 
 
+class AdminWithdrawalApproveRequest(ApiBase):
+    id: int
+    notify_mode: str = "both"  # "both" | "channel_only"
+
+
 @api_app.post("/api/admin/withdrawals/approve")
-async def api_admin_withdrawals_approve(body: AdminIdRequest):
+async def api_admin_withdrawals_approve(body: AdminWithdrawalApproveRequest):
     user = await _authenticate(body)
     _require_admin(user)
-    result = await approve_withdrawal_core(body.id)
+    mode = body.notify_mode if body.notify_mode in ("both", "channel_only") else "both"
+    result = await approve_withdrawal_core(body.id, notify_mode=mode)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["reason"])
     return {"ok": True}
