@@ -1243,24 +1243,25 @@ async function shareLink(){
   const btn = document.getElementById("shareLinkBtn");
   if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
 
-  // 1) Send the nice forwardable card (photo + button) to their own chat
-  //    with the bot, in case they want to manually long-press → Forward
-  //    that exact rich version later.
-  api("/api/invite/share_card", {}).catch(() => {});
-
-  // 2) Telegram's Bot API has no way to auto-open the "Forward" picker for
-  //    an already-sent message — only the person long-pressing a message
-  //    can do that. The only chat-picker Telegram lets us open directly is
-  //    this share-url one, so we use it to reproduce the same "pick a
-  //    friend, tap send" flow as before, with our text pre-filled.
-  const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
-             + "✅ Complete simple tasks\n"
-             + "✅ Watch short ads\n"
-             + "✅ Invite friends for bonus rewards\n"
-             + "✅ Withdraw straight to Telebirr\n\n"
-             + "Join now 👇";
-  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
-  tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
+  // switchInlineQuery opens Telegram's native "choose a chat" picker and,
+  // once the user picks someone, has the BOT deliver the message directly
+  // into that chat — photo + inline "Join" button included. A manual
+  // Forward of a bot message strips its buttons, so this inline-mode
+  // route (what most invite/referral bots actually use) is what keeps
+  // everything intact, not just plain forwarding.
+  if (tg?.switchInlineQuery){
+    tg.switchInlineQuery("invite", ["users", "groups", "channels"]);
+  } else {
+    // Fallback for testing outside Telegram (e.g. a desktop browser preview)
+    const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
+               + "✅ Complete simple tasks\n"
+               + "✅ Watch short ads\n"
+               + "✅ Invite friends for bonus rewards\n"
+               + "✅ Withdraw straight to Telebirr\n\n"
+               + "Join now 👇";
+    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
+    window.open(shareUrl, "_blank");
+  }
 
   if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
 }
