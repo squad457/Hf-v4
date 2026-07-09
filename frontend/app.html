@@ -1253,7 +1253,12 @@ async function shareLink(){
   //    can do that. The only chat-picker Telegram lets us open directly is
   //    this share-url one, so we use it to reproduce the same "pick a
   //    friend, tap send" flow as before, with our text pre-filled.
-  const text = "🎉 I'm earning real money with this bot — join and start earning too! 🎁";
+  const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
+             + "✅ Complete simple tasks\n"
+             + "✅ Watch short ads\n"
+             + "✅ Invite friends for bonus rewards\n"
+             + "✅ Withdraw straight to Telebirr\n\n"
+             + "Join now 👇";
   const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
   tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
 
