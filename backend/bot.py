@@ -352,6 +352,12 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
     "ALTER TABLE users         ADD COLUMN last_verify_msg_id INTEGER DEFAULT 0",
     "ALTER TABLE users         ADD COLUMN last_seen TEXT DEFAULT ''",
+    # 1 = counts toward the referrer's own "Direct" stat (paid, or the
+    # skip feature is off / this row predates it). Set to 0 only when
+    # referral_skip silently withholds this referral's payout — so a
+    # skipped join never shows up in the referrer's own numbers at all,
+    # not just missing a payout notification.
+    "ALTER TABLE users         ADD COLUMN referral_paid INTEGER DEFAULT 1",
     "ALTER TABLE tasks         ADD COLUMN created_by    INTEGER DEFAULT 0",
     "ALTER TABLE tasks         ADD COLUMN budget_slots  INTEGER DEFAULT 0",
     "ALTER TABLE tasks         ADD COLUMN slots_used    INTEGER DEFAULT 0",
@@ -456,6 +462,37 @@ class DataEngine:
             return False
         skip_positions = set(rng.sample(range(1, batch_size + 1), skip_count))
         return position_in_batch in skip_positions
+
+    @staticmethod
+    async def mark_referral_unpaid(user_id: int):
+        """Called when referral_skip decides this user's join shouldn't be
+        paid out — also hides them from the referrer's own 'Direct' count
+        (see get_paid_referral_metrics), not just from the payout message."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET referral_paid = 0 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    @staticmethod
+    async def get_paid_referral_metrics(user_id: int):
+        """Same shape as get_referral_metrics, but only counts referrals
+        that were actually paid — this is what the referrer themselves
+        should see (bot chat, Mini App Invite tab). Admin-facing views
+        should keep using get_referral_metrics (the true, unfiltered
+        count) since referral_skip's whole point is that only the
+        referrer stays unaware of it."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur1 = await db.execute(
+                "SELECT COUNT(*) FROM users WHERE referred_by = ? AND referral_paid = 1", (user_id,)
+            )
+            direct_count = (await cur1.fetchone())[0] or 0
+            cur2 = await db.execute(
+                "SELECT COUNT(*) FROM users u2 "
+                "JOIN users u1 ON u2.referred_by = u1.user_id "
+                "WHERE u1.referred_by = ? AND u1.referral_paid = 1",
+                (user_id,)
+            )
+            tier2_count = (await cur2.fetchone())[0] or 0
+            return direct_count, tier2_count
 
     @staticmethod
     async def get_referral_metrics(user_id: int):
@@ -1604,7 +1641,7 @@ async def process_referral_query(callback: CallbackQuery):
     if not await DataEngine.is_verified(uid):
         if not await enforce_membership_gate(callback, uid):
             return
-    direct, _    = await DataEngine.get_referral_metrics(uid)
+    direct, _    = await DataEngine.get_paid_referral_metrics(uid)
     rate         = float(await DataEngine.get_setting("reward_per_referral", "10"))
     me           = await bot.get_me()
     link         = f"https://t.me/{me.username}?start={uid}"
@@ -2855,9 +2892,12 @@ async def api_verify(body: VerifyRequest, request: Request):
                 )
             except Exception:
                 pass
-        # else: referral is still counted in their "Referrals" stat (it's a
-        # real join), it just isn't paid — no message is sent for it so the
-        # skip pattern stays invisible to the referrer.
+        else:
+            # Not paid — and hidden from the referrer's own "Direct" count
+            # too (get_paid_referral_metrics), so the skip pattern stays
+            # invisible to them in every number they can see, not just in
+            # the missing payout message.
+            await DataEngine.mark_referral_unpaid(uid)
 
     if body.msgId:
         try:
@@ -2879,7 +2919,7 @@ async def api_verify(body: VerifyRequest, request: Request):
 @api_app.post("/api/me")
 async def api_me(body: ApiBase):
     user = await _authenticate(body)
-    direct, tier2 = await DataEngine.get_referral_metrics(user["user_id"])
+    direct, tier2 = await DataEngine.get_paid_referral_metrics(user["user_id"])
     rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
     uname = BOT_USERNAME or (await bot.get_me()).username
