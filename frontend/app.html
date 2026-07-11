@@ -319,6 +319,8 @@ label.f{font-size:.68rem;color:var(--ink-faint);font-weight:700;margin-bottom:6p
 .toast.success .t-ic{background:rgba(200,242,77,.15);color:var(--lime);}
 .toast.error .t-ic{background:rgba(255,96,85,.15);color:var(--danger);}
 .toast.info .t-ic{background:rgba(255,180,84,.15);color:var(--amber);}
+.toast.loading .t-ic{background:rgba(255,180,84,.15);color:var(--amber);}
+.toast.loading .spin-ico{border-color:rgba(255,180,84,.35);border-top-color:var(--amber);}
 .toast .t-msg{line-height:1.3;}
 .empty{text-align:center;padding:34px 10px;color:var(--ink-faint);font-size:.82rem;}
 .pill-tag{display:inline-block;font-family:'Inter',sans-serif;font-size:.56rem;font-weight:700;padding:3px 8px;border-radius:5px;letter-spacing:.04em;}
@@ -408,20 +410,22 @@ let ADS = null;
 let UTC = null; // user_task_config from /api/tasks
 let adController = null;
 
-function toast(msg, type){
+function toast(msg, type, opts){
   if (!type){
     if (/^(✅|🎉)/.test(msg)) type = "success";
     else if (/^(❌|🚫|⚠️)/.test(msg)) type = "error";
     else type = "info";
   }
-  const icons = { success: "✓", error: "✕", info: "i" };
+  const icons = { success: "✓", error: "✕", info: "i", loading: '<span class="spin-ico"></span>' };
   const t = document.getElementById("toast");
   clearTimeout(t._h);
   t.classList.remove("show");
   t.className = "toast " + type;
   t.innerHTML = `<span class="t-ic">${icons[type]}</span><span class="t-msg">${escapeHtml(msg)}</span>`;
   requestAnimationFrame(() => requestAnimationFrame(() => t.classList.add("show")));
-  t._h = setTimeout(() => t.classList.remove("show"), 2600);
+  if (!opts?.sticky){
+    t._h = setTimeout(() => t.classList.remove("show"), 2600);
+  }
 }
 
 async function api(path, body = {}) {
@@ -1242,31 +1246,34 @@ function copyLink(){
 async function shareLink(){
   const btn = document.getElementById("shareLinkBtn");
   if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
+  toast("Preparing your invite link…", "loading", { sticky: true });
 
-  // Two ways to share, offered together:
-  // 1) Send the card straight into the bot chat too — handy if they'd
-  //    rather forward it themselves, or share it outside Telegram's
-  //    picker. Rate-limited server-side (25 min) so this can't be spammed.
-  api("/api/invite/share_card", {})
-    .then(() => toast("💬 Also sent to your chat with the bot"))
-    .catch((e) => {
-      if (e.message?.startsWith("cooldown:")){
-        const mins = Math.ceil(parseInt(e.message.split(":")[1], 10) / 60);
-        toast(`💬 You can resend it in your bot chat in ~${mins} min`);
-      }
-      // any other failure here is silent — the picker flow below still works
-    });
+  try {
+    // The send itself is fast — awaited here (not fire-and-forget) so we
+    // can show a real success state before minimizing the Mini App.
+    await api("/api/invite/share_card", {});
+    toast("✅ Sent to your chat!");
+    if (btn){ btn.innerHTML = "✅ Sent!"; }
+    if (tg?.close){
+      // Brief pause so the success toast is actually visible before the
+      // Mini App minimizes and the person lands back in their chat.
+      setTimeout(() => tg.close(), 550);
+      return;
+    }
+  } catch (e) {
+    if (e.message?.startsWith("cooldown:")){
+      const mins = Math.ceil(parseInt(e.message.split(":")[1], 10) / 60);
+      toast(`💬 You can resend it in your bot chat in ~${mins} min`);
+    } else {
+      toast("⚠️ Couldn't send — try again");
+    }
+  }
 
-  // 2) switchInlineQuery opens Telegram's native "choose a chat" picker
-  //    and, once picked, has the BOT deliver the message directly into
-  //    that chat — photo + inline "Join" button included. A manual
-  //    Forward of a bot message strips its buttons, so this inline-mode
-  //    route (what most invite/referral bots actually use) is what keeps
-  //    everything intact, not just plain forwarding.
+  // Outside Telegram (e.g. desktop browser preview), or on cooldown —
+  // fall back to Telegram's native chat picker or a plain share link.
   if (tg?.switchInlineQuery){
     tg.switchInlineQuery("invite", ["users", "groups", "channels"]);
   } else {
-    // Fallback for testing outside Telegram (e.g. a desktop browser preview)
     const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
                + "✅ Complete simple tasks\n"
                + "✅ Watch short ads\n"
