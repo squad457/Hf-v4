@@ -32,12 +32,14 @@
   --danger:#ff6055;
   --ink:#f3f4f1; --ink-dim:#9a9d97; --ink-faint:#55584f;
 }
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
 html,body{height:100%;overflow:hidden}
 body{
   background:var(--bg);color:var(--ink);font-family:'Inter',system-ui,-apple-system,sans-serif;
   -webkit-font-smoothing:antialiased;
 }
+button,a,input,select,textarea{-webkit-tap-highlight-color:transparent;outline:none;}
+button:focus,a:focus{outline:none;}
 body::before{
   content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(ellipse 70% 40% at 50% -10%,rgba(200,242,77,.06) 0%,transparent 60%);
