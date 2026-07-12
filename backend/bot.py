@@ -2788,15 +2788,28 @@ class ApiBase(BaseModel):
 
 async def _authenticate(body: ApiBase) -> dict:
     """Validates Telegram WebApp initData and returns the users-table row
-    as a plain dict. Creates the user row on first contact (mirrors what
-    /start does on the bot side) and bumps last_seen for the online-users
-    stat. Raises 401 for a bad signature and 403 for a banned account."""
+    as a plain dict. Raises 403 'not_verified' if this user has never
+    completed /api/verify — this is what actually enforces the channel
+    gate, fingerprint/VPN/clone-risk checks, and referral attribution,
+    since none of those run anywhere else. Without this check, anyone
+    opening app.html directly (Telegram's native bot-profile "Open App"
+    button, or any other direct link) would get a fully working, fully
+    unverified account with zero fraud checks and no referrer ever
+    attributed — the entire index.html verification flow would be
+    optional rather than required."""
     tg_user = parse_telegram_webapp_handshake(body.initData)
     if not tg_user or "id" not in tg_user:
         raise HTTPException(status_code=401, detail="invalid_init_data")
     user_id = int(tg_user["id"])
+    if not await DataEngine.is_verified(user_id):
+        raise HTTPException(status_code=403, detail="not_verified")
     row = await DataEngine.get_user(user_id)
     if not row:
+        # Verified (has a verifications row) but somehow missing its users
+        # row — self-heal instead of crashing, same pattern used elsewhere
+        # (e.g. the admin "Full Unban" path). No referrer here since a
+        # genuinely fresh signup would have gone through /api/verify,
+        # which always creates the users row itself.
         full_name = (
             f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip()
             or tg_user.get("username", "") or str(user_id)
