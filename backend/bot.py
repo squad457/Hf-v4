@@ -767,6 +767,34 @@ class DataEngine:
                 raise e
 
     @staticmethod
+    async def deduct_balance_atomic(user_id: int, amount: float) -> bool:
+        """Atomically checks sufficient balance and deducts it in one
+        BEGIN EXCLUSIVE transaction — same pattern as
+        create_withdrawal_atomic. Returns False (deducting nothing) if
+        the balance is insufficient. Without this, a separate
+        SELECT-balance-then-UPDATE check (as user task creation used to
+        do) can be raced by two concurrent requests that both read the
+        same starting balance and both pass the check, overdrawing the
+        account into the negative."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                row = await cur.fetchone()
+                if not row or round(float(row[0]), 2) < round(amount, 2):
+                    await db.execute("ROLLBACK")
+                    return False
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance - ?, 2) WHERE user_id = ?",
+                    (amount, user_id),
+                )
+                await db.execute("COMMIT")
+                return True
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
     async def get_withdrawal(wid: int):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -879,6 +907,61 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
+    async def claim_video_ad_atomic(
+        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
+    ) -> tuple[bool, str]:
+        """Re-checks the daily cap and cooldown AND records+pays the
+        reward, all inside one BEGIN EXCLUSIVE transaction (same pattern
+        as create_withdrawal_atomic). There's no single row to guard here
+        the way task/direct-link claims can (this is a per-day COUNT, not
+        a status flip on one row), so several /api/ads/claim requests
+        fired at once could otherwise all read the same "watched_today"
+        value before any of them commits, letting the daily cap be
+        bypassed entirely. The exclusive lock serializes that."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
+                    "AND status='completed' AND date(completed_at)=date('now')",
+                    (user_id,),
+                )
+                watched_today = (await cur.fetchone())[0]
+                if watched_today >= daily_limit:
+                    await db.execute("ROLLBACK")
+                    return False, "daily_limit_reached"
+
+                cur2 = await db.execute(
+                    "SELECT completed_at FROM ad_events WHERE user_id=? AND kind='video' "
+                    "AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+                    (user_id,),
+                )
+                last = await cur2.fetchone()
+                if last and last[0]:
+                    try:
+                        elapsed = (datetime.utcnow() - datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                        if elapsed < cooldown_seconds:
+                            await db.execute("ROLLBACK")
+                            return False, "cooldown_active"
+                    except Exception:
+                        pass
+
+                await db.execute(
+                    "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
+                    "VALUES (?, 'video', 'completed', ?, datetime('now'))",
+                    (user_id, reward),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                    (reward, user_id),
+                )
+                await db.execute("COMMIT")
+                return True, ""
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
     async def log_ad_click(user_id: int, kind: str):
         """Lightweight analytics-only row — logged the moment a user taps
         'Watch Ad' / opens the ad, BEFORE we know whether they'll finish
@@ -967,13 +1050,19 @@ class DataEngine:
             return await cur.fetchone()
 
     @staticmethod
-    async def complete_ad_event(event_id: int, reward: float):
+    async def complete_ad_event(event_id: int, reward: float) -> bool:
+        """Atomically transitions an ad_events row to 'completed'. Returns
+        True only for the call that actually performs that transition —
+        the WHERE guard means a concurrent/duplicate claim for the same
+        event_id can never both succeed, closing a double-reward race."""
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE ad_events SET status='completed', reward=?, completed_at=datetime('now') WHERE id=?",
+            cur = await db.execute(
+                "UPDATE ad_events SET status='completed', reward=?, completed_at=datetime('now') "
+                "WHERE id=? AND status != 'completed'",
                 (reward, event_id),
             )
             await db.commit()
+            return cur.rowcount > 0
 
     @staticmethod
     async def remove_force_channel(row_id: int):
@@ -1083,6 +1172,42 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
+    async def cancel_user_task_atomic(task_id: int, created_by: int) -> tuple[bool, float]:
+        """Atomically flips a task to 'cancelled' and pays its refund, all
+        in one BEGIN EXCLUSIVE transaction. Without this, two concurrent
+        /api/tasks/cancel calls for the same task could both read
+        review_status='approved' before either commits, and both pay out
+        a refund for the same unused slots."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT created_by, review_status, budget_slots, slots_used, reward "
+                    "FROM tasks WHERE id=?", (task_id,)
+                )
+                row = await cur.fetchone()
+                if not row or row[0] != created_by or row[1] not in ("pending", "approved"):
+                    await db.execute("ROLLBACK")
+                    return False, 0.0
+                budget_slots, slots_used, reward = row[2], row[3], row[4]
+                unused_slots = max(0, int(budget_slots) - int(slots_used))
+                refund = round(unused_slots * float(reward), 2)
+                await db.execute(
+                    "UPDATE tasks SET is_active=0, review_status='cancelled' WHERE id=?",
+                    (task_id,),
+                )
+                if refund > 0:
+                    await db.execute(
+                        "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                        (refund, created_by),
+                    )
+                await db.execute("COMMIT")
+                return True, refund
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
     async def delete_task(task_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1141,14 +1266,21 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
-    async def mark_task_completed(user_id: int, task_id: int):
+    async def mark_task_completed(user_id: int, task_id: int) -> bool:
+        """Atomically transitions task_progress 'checked' -> 'completed'.
+        Returns True only for the call that actually performs that
+        transition. If two /api/tasks/claim requests for the same task
+        race each other (double-tap, retry), the guarded WHERE means only
+        one UPDATE can ever match a row — the other gets rowcount 0 and
+        must not pay out, closing a double-reward race."""
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
+            cur = await db.execute(
                 "UPDATE task_progress SET status='completed', completed_at=datetime('now') "
-                "WHERE user_id = ? AND task_id = ?",
+                "WHERE user_id = ? AND task_id = ? AND status='checked'",
                 (user_id, task_id),
             )
             await db.commit()
+            return cur.rowcount > 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FRAUD DETECTION ENGINE  (v5 — correlation-based)
@@ -2255,10 +2387,30 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
     await execute_withdrawal_rejection(message, tid, ticket, message.text.strip())
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
-    await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
-    # Refund the reserved balance back to the user — it was deducted
-    # atomically at request time in create_withdrawal_atomic().
-    await DataEngine.add_balance(ticket["user_id"], float(ticket["amount"]))
+    # Atomic re-check-and-refund: the caller's own "status == pending"
+    # check above can be raced (double-tap, two admins), so this is the
+    # actual guard against refunding the same ticket's reserved balance
+    # twice — status flip and balance credit happen in one transaction.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN EXCLUSIVE")
+        try:
+            cur = await db.execute("SELECT status FROM withdrawals WHERE id=?", (tid,))
+            row = await cur.fetchone()
+            if not row or row[0] != "pending":
+                await db.execute("ROLLBACK")
+                return
+            await db.execute(
+                "UPDATE withdrawals SET status='rejected', channel_post_id=?, reason=?, resolved_at=datetime('now') WHERE id=?",
+                (ticket["channel_post_id"], reason, tid),
+            )
+            await db.execute(
+                "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                (float(ticket["amount"]), ticket["user_id"]),
+            )
+            await db.execute("COMMIT")
+        except Exception:
+            await db.execute("ROLLBACK")
+            raise
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected!</b>\n\n"
         f"💰 <b>Amount:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
@@ -3209,23 +3361,9 @@ async def api_ads_claim(body: ApiBase):
     cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
     reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
 
-    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
-    if watched_today >= daily_limit:
-        raise HTTPException(status_code=400, detail="daily_limit_reached")
-
-    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_VIDEO)
-    if last_at:
-        try:
-            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
-            if elapsed < cooldown_seconds:
-                raise HTTPException(status_code=400, detail="cooldown_active")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-    await DataEngine.record_ad_event(uid, AD_KIND_VIDEO, reward_amount)
-    await DataEngine.add_balance(uid, reward_amount)
+    ok, reason = await DataEngine.claim_video_ad_atomic(uid, reward_amount, daily_limit, cooldown_seconds)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
     return {"credited": reward_amount}
 
 
@@ -3290,7 +3428,9 @@ async def api_ads_direct_link_claim(body: AdDirectLinkClaimRequest):
     if elapsed < wait_seconds:
         raise HTTPException(status_code=400, detail=f"wait:{int(wait_seconds - elapsed)}")
 
-    await DataEngine.complete_ad_event(body.event_id, reward_amount)
+    claimed = await DataEngine.complete_ad_event(body.event_id, reward_amount)
+    if not claimed:
+        raise HTTPException(status_code=400, detail="not_claimable")
     await DataEngine.add_balance(uid, reward_amount)
     fresh = await DataEngine.get_user(uid)
     return {"credited": reward_amount, "balance": float(fresh["balance"])}
@@ -3404,7 +3544,12 @@ async def api_tasks_claim(body: TaskActionRequest):
         # /api/tasks/check) to collect a reward without ever actually
         # joining / passing verification.
         raise HTTPException(status_code=400, detail="not_checked")
-    await DataEngine.mark_task_completed(uid, body.task_id)
+    claimed = await DataEngine.mark_task_completed(uid, body.task_id)
+    if not claimed:
+        # Lost a race to a concurrent/duplicate claim for this exact task
+        # (or the prior checks above were stale by the time we got here) —
+        # do not pay out a second time.
+        raise HTTPException(status_code=400, detail="not_claimable")
     await DataEngine.add_balance(uid, float(task["reward"]))
     # If this is a user-created (escrow-funded) task, count the slot the
     # creator already paid for at creation time — the reward above came
@@ -3498,6 +3643,8 @@ async def api_tasks_create(body: UserTaskCreateRequest):
     total_cost = round(body.reward * body.budget_slots, 2)
     fresh = await DataEngine.get_user(uid)
     if not fresh or float(fresh["balance"]) < total_cost:
+        # Fast, friendly pre-check — the real enforcement is the atomic
+        # deduct right before escrow below, which is race-safe.
         raise HTTPException(status_code=400, detail="insufficient_balance")
 
     # Re-verify bot-admin status ourselves — never trust the client's word
@@ -3519,7 +3666,11 @@ async def api_tasks_create(body: UserTaskCreateRequest):
 
     # Escrow the full budget immediately — this is what lets us pay each
     # completer out of the same pool later without minting new balance.
-    await DataEngine.add_balance(uid, -total_cost)
+    # Atomic re-check-and-deduct: two concurrent /api/tasks/create calls
+    # can no longer both pass the earlier balance check and overdraw it.
+    escrowed = await DataEngine.deduct_balance_atomic(uid, total_cost)
+    if not escrowed:
+        raise HTTPException(status_code=400, detail="insufficient_balance")
     task_id = await DataEngine.create_task(
         title, channel_id, link, task_type, body.reward,
         created_by=uid, budget_slots=body.budget_slots, review_status="pending",
@@ -3545,15 +3696,9 @@ async def api_tasks_cancel(body: TaskActionRequest):
     task = await DataEngine.get_task(body.task_id)
     if not task or task["created_by"] != uid:
         raise HTTPException(status_code=404, detail="task_not_found")
-    if task["review_status"] not in ("pending", "approved"):
+    ok, refund = await DataEngine.cancel_user_task_atomic(body.task_id, uid)
+    if not ok:
         raise HTTPException(status_code=400, detail="nothing_to_cancel")
-    unused_slots = max(0, int(task["budget_slots"]) - int(task["slots_used"]))
-    if unused_slots == 0:
-        raise HTTPException(status_code=400, detail="nothing_to_cancel")
-    refund = round(unused_slots * float(task["reward"]), 2)
-    if refund > 0:
-        await DataEngine.add_balance(uid, refund)
-    await DataEngine.update_task(body.task_id, is_active=0, review_status="cancelled")
     return {"ok": True, "refunded": refund}
 
 
