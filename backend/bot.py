@@ -236,6 +236,20 @@ CREATE TABLE IF NOT EXISTS fraud_log (
     logged_at   TEXT    DEFAULT (datetime('now'))
 );
 
+-- Durable (DB-backed) stand-in for the old FSMContext-only
+-- "stashed_referrer_id". A person can sit on the "join these channels
+-- first" screen for a long time before tapping Joined, and the bot's
+-- FSM storage is in-memory (see MemoryStorage()) — a restart/redeploy
+-- in that window used to silently drop their referrer with no trace.
+-- This survives that: /start writes here immediately, and it's read
+-- back at verification time regardless of whether the in-memory FSM
+-- state is still around.
+CREATE TABLE IF NOT EXISTS pending_referrals (
+    user_id      INTEGER PRIMARY KEY,
+    referrer_id  INTEGER NOT NULL,
+    created_at   TEXT    DEFAULT (datetime('now'))
+);
+
 -- ─────────────────────────────────────────────────────────────────────────
 -- MINI APP TASK SYSTEM
 -- task_type: 'force' (bot must be admin in channel_id → real membership
@@ -464,6 +478,44 @@ class DataEngine:
         return position_in_batch in skip_positions
 
     @staticmethod
+    async def stash_pending_referral(user_id: int, referrer_id: int):
+        """Called from /start the moment we see a ?ref= param — before we
+        know if the person will pass the membership gate or when they'll
+        tap 'Joined'. Written to disk immediately so it isn't lost if the
+        bot restarts while they're still off joining channels."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO pending_referrals (user_id, referrer_id, created_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(user_id) DO UPDATE SET referrer_id=excluded.referrer_id, "
+                "created_at=excluded.created_at",
+                (user_id, referrer_id),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_pending_referral(user_id: int):
+        """Returns the stashed referrer_id if one exists and is recent
+        (7 days — long enough to cover any realistic gap between /start
+        and finishing verification, short enough that a genuinely stale
+        one from months ago isn't wrongly resurrected)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT referrer_id FROM pending_referrals "
+                "WHERE user_id=? AND created_at >= datetime('now','-7 days')",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            return row["referrer_id"] if row else None
+
+    @staticmethod
+    async def clear_pending_referral(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
+            await db.commit()
+
+    @staticmethod
     async def mark_referral_unpaid(user_id: int):
         """Called when referral_skip decides this user's join shouldn't be
         paid out — also hides them from the referrer's own 'Direct' count
@@ -586,19 +638,32 @@ class DataEngine:
         canvas_hash: str = "",
         webgl_hash: str = "",
         screen_sig: str = "",
-    ):
+    ) -> bool:
+        """Atomically claims the verification slot for this user_id.
+        verifications.user_id is UNIQUE, and this is a plain INSERT (not
+        OR REPLACE), so if two /api/verify requests for the same uid ever
+        race each other (double-tap, network retry, two tabs...), only
+        ONE of them can succeed here — SQLite serializes the write and
+        rejects the second with an IntegrityError. Returns True only for
+        the call that actually won that race; the caller must treat False
+        as "already verified" and skip account creation / referral payout
+        entirely, so a race can never pay a referral reward twice."""
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO verifications "
-                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
-                "tg_platform, tg_version, tg_app_version, "
-                "canvas_hash, webgl_hash, screen_sig) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (user_id, ip, ua, fingerprint, referrer_ip,
-                 tg_platform, tg_version, tg_app_version,
-                 canvas_hash, webgl_hash, screen_sig),
-            )
-            await db.commit()
+            try:
+                await db.execute(
+                    "INSERT INTO verifications "
+                    "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
+                    "tg_platform, tg_version, tg_app_version, "
+                    "canvas_hash, webgl_hash, screen_sig) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, ip, ua, fingerprint, referrer_ip,
+                     tg_platform, tg_version, tg_app_version,
+                     canvas_hash, webgl_hash, screen_sig),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
 
     @staticmethod
     async def get_verification(user_id: int):
@@ -1535,6 +1600,10 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
     s   = await state.get_data()
     ref = s.get("stashed_referrer_id", 0)
     await state.clear()
+    if not ref:
+        # FSM memory is gone (bot restarted while they were off joining
+        # channels) — recover the referrer from the durable DB stash instead.
+        ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
         await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
@@ -1563,6 +1632,13 @@ async def process_start_command(message: Message, state: FSMContext):
     args = message.text.split()
     arg  = args[1] if len(args) > 1 else ""
     ref  = int(arg) if arg.isdigit() and int(arg) != uid else 0
+
+    if ref:
+        # Written to disk immediately — the membership-gate wait that
+        # follows can take anywhere from seconds to hours, and the old
+        # FSMContext-only stash below doesn't survive a bot restart in
+        # that window. This does.
+        await DataEngine.stash_pending_referral(uid, ref)
 
     acc = await DataEngine.get_user(uid)
     if acc and acc["is_banned"]:
@@ -2820,6 +2896,8 @@ async def api_verify(body: VerifyRequest, request: Request):
 
     uid = body.uid
     ref = body.refId if body.refId and body.refId != uid else 0
+    if not ref:
+        ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
         return {"status": "already_verified"}
@@ -2855,9 +2933,27 @@ async def api_verify(body: VerifyRequest, request: Request):
             await DataEngine.ban_ip(client_ip, reason)
         return {"status": "blocked", "reason": reason}
 
-    # Passed every check — create the account (linking the referrer only
-    # on first creation), save the verification fingerprint, start the IP
-    # cooldown window, and pay the referrer's bonus.
+    # Passed every check — atomically claim the verification slot FIRST.
+    # This is the actual guard against double-paying a referral: if a
+    # duplicate/concurrent request for this exact uid is racing this one
+    # (double-tap, retry, two tabs), only one of the two INSERTs below can
+    # win. The loser returns immediately, before touching the account or
+    # the referrer's balance at all.
+    claimed = await DataEngine.save_verification(
+        uid, client_ip, body.ua, body.fingerprint,
+        referrer_ip="", tg_platform=body.tgPlatform, tg_version=body.tgVersion,
+        tg_app_version=body.tgAppVersion, canvas_hash=body.canvasHash,
+        webgl_hash=body.webglHash, screen_sig=body.screenSig,
+    )
+    if not claimed:
+        return {"status": "already_verified"}
+
+    await ip_cooldown.mark_verified(client_ip)
+
+    # Create the account (linking the referrer only on first creation) and
+    # pay the referrer's bonus — safe now, since `claimed` above guarantees
+    # this is the one and only request that will ever reach this point for
+    # this uid.
     referrer_row = await DataEngine.get_user(ref) if ref else None
     referred_by = ref if referrer_row else None
 
@@ -2868,14 +2964,10 @@ async def api_verify(body: VerifyRequest, request: Request):
             or tg_user.get("username", "") or str(uid)
         )
         await DataEngine.create_user(uid, tg_user.get("username", "") or "", full_name, referred_by)
-
-    await DataEngine.save_verification(
-        uid, client_ip, body.ua, body.fingerprint,
-        referrer_ip="", tg_platform=body.tgPlatform, tg_version=body.tgVersion,
-        tg_app_version=body.tgAppVersion, canvas_hash=body.canvasHash,
-        webgl_hash=body.webglHash, screen_sig=body.screenSig,
-    )
-    await ip_cooldown.mark_verified(client_ip)
+    if ref:
+        # Used (or superseded by an existing account) — clear it either way
+        # so it doesn't linger and get picked up by some unrelated future flow.
+        await DataEngine.clear_pending_referral(uid)
 
     if referred_by:
         direct_count, _ = await DataEngine.get_referral_metrics(referred_by)
