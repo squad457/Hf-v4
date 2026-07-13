@@ -69,7 +69,26 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "").rstrip("/") or WEBAPP_URL
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
-DB_PATH              = "referral_bot.db"
+# ── Database location ──────────────────────────────────────────────────
+# IMPORTANT (Railway / most container hosts): the default filesystem a
+# service runs on is EPHEMERAL — every redeploy/restart starts from a
+# clean container, so a DB file written to a plain relative path like
+# "referral_bot.db" is silently wiped on every deploy. This also erases
+# the `verifications` table, which is what the multi-account/clone
+# detection (evaluate_clone_risk) correlates against — with no history
+# left after each deploy, it always sees a "brand new" user and never
+# finds a match, so multi-account detection quietly stops working too.
+#
+# Fix: attach a Railway Volume to this service (Dashboard → your service
+# → Volumes → New Volume, e.g. mount path "/data"), then set the
+# DB_PATH environment variable to a path inside that mount, e.g.:
+#   DB_PATH=/data/referral_bot.db
+# Without a volume attached, DB_PATH falls back to the old relative path
+# and the database will keep resetting on every deploy exactly as before.
+DB_PATH = os.getenv("DB_PATH", "referral_bot.db")
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
 TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 
 # How old a Telegram WebApp initData payload is allowed to be before we
