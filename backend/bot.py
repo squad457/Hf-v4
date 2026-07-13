@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import hmac
+import random
 import asyncio
 import hashlib
 import logging
@@ -33,7 +34,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo
+    WebAppInfo, FSInputFile, InlineQuery, InlineQueryResultCachedPhoto,
+    InlineQueryResultArticle, InputTextMessageContent
 )
 
 from fastapi import FastAPI, Request, HTTPException
@@ -60,6 +62,12 @@ logger.info("══════════════════════�
 BOT_TOKEN            = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
 PAYMENT_LOG_CHANNEL  = os.getenv("PAYMENT_LOG_CHANNEL", "").strip()
+# Private channel (only you, the admin, should be a member of it) that
+# receives a copy of the SQLite database file on a schedule — a safety
+# net in case the Railway Volume is ever lost/corrupted. Leave empty to
+# disable backups entirely.
+DB_BACKUP_CHANNEL_ID   = os.getenv("DB_BACKUP_CHANNEL_ID", "").strip()
+DB_BACKUP_INTERVAL_HOURS = int(os.getenv("DB_BACKUP_INTERVAL_HOURS", "24"))
 # WEBAPP_URL = this backend's OWN public URL (Railway). Used for API calls
 # and to build the /verify page link. Kept for backward compatibility.
 WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("/")
@@ -69,26 +77,7 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "").rstrip("/") or WEBAPP_URL
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
-# ── Database location ──────────────────────────────────────────────────
-# IMPORTANT (Railway / most container hosts): the default filesystem a
-# service runs on is EPHEMERAL — every redeploy/restart starts from a
-# clean container, so a DB file written to a plain relative path like
-# "referral_bot.db" is silently wiped on every deploy. This also erases
-# the `verifications` table, which is what the multi-account/clone
-# detection (evaluate_clone_risk) correlates against — with no history
-# left after each deploy, it always sees a "brand new" user and never
-# finds a match, so multi-account detection quietly stops working too.
-#
-# Fix: attach a Railway Volume to this service (Dashboard → your service
-# → Volumes → New Volume, e.g. mount path "/data"), then set the
-# DB_PATH environment variable to a path inside that mount, e.g.:
-#   DB_PATH=/data/referral_bot.db
-# Without a volume attached, DB_PATH falls back to the old relative path
-# and the database will keep resetting on every deploy exactly as before.
-DB_PATH = os.getenv("DB_PATH", "referral_bot.db")
-_db_dir = os.path.dirname(DB_PATH)
-if _db_dir:
-    os.makedirs(_db_dir, exist_ok=True)
+DB_PATH               = os.getenv("DB_PATH", "referral_bot.db")
 TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 
 # How old a Telegram WebApp initData payload is allowed to be before we
@@ -98,7 +87,7 @@ TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 # recommends checking auth_date for exactly this reason.
 MAX_INIT_DATA_AGE_SECONDS = int(os.getenv("MAX_INIT_DATA_AGE_SECONDS", str(6 * 3600)))
 
-TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
+TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAIBImpM6RKFmzDV8HLYo0XHukkMK-RaAAI-D2sbGJdwUazZrBH4OObkAQADAgADeAADPAQ"
 
 if not WEBAPP_URL.startswith(("http://", "https://")):
     WEBAPP_URL = f"https://{WEBAPP_URL}"
@@ -247,6 +236,20 @@ CREATE TABLE IF NOT EXISTS fraud_log (
     logged_at   TEXT    DEFAULT (datetime('now'))
 );
 
+-- Durable (DB-backed) stand-in for the old FSMContext-only
+-- "stashed_referrer_id". A person can sit on the "join these channels
+-- first" screen for a long time before tapping Joined, and the bot's
+-- FSM storage is in-memory (see MemoryStorage()) — a restart/redeploy
+-- in that window used to silently drop their referrer with no trace.
+-- This survives that: /start writes here immediately, and it's read
+-- back at verification time regardless of whether the in-memory FSM
+-- state is still around.
+CREATE TABLE IF NOT EXISTS pending_referrals (
+    user_id      INTEGER PRIMARY KEY,
+    referrer_id  INTEGER NOT NULL,
+    created_at   TEXT    DEFAULT (datetime('now'))
+);
+
 -- ─────────────────────────────────────────────────────────────────────────
 -- MINI APP TASK SYSTEM
 -- task_type: 'force' (bot must be admin in channel_id → real membership
@@ -278,20 +281,26 @@ CREATE INDEX IF NOT EXISTS idx_task_progress_user ON task_progress(user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_position     ON tasks(position);
 
 -- ─────────────────────────────────────────────────────────────────────────
--- ADSGRAM REWARDED ADS
--- Every completed ad view is logged here. Balance is only ever credited
--- server-side (in DataEngine.credit_ad_view, inside this same table's
--- insert), never trusted purely from a client-side "ad finished" event —
--- the daily cap + cooldown below are enforced from these rows, not from
--- anything the browser reports about itself.
+-- ADSGRAM — REWARDED VIDEO + DIRECT LINK
+-- kind: 'video'       (AdsGram SDK rewarded interstitial, completion
+--                       confirmed client-side by the SDK promise, then
+--                       claimed straight away — no wait timer needed)
+--     | 'direct_link' (AdsGram Direct Link/Smart Link — no SDK callback
+--                       exists for this format, so we use the same
+--                       open → wait → claim pattern as 'fake' tasks)
+-- status: 'pending' (direct_link opened, waiting out the timer)
+--       | 'completed'
 -- ─────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS ad_views (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER,
-    amount     REAL,
-    created_at TEXT DEFAULT (datetime('now'))
+CREATE TABLE IF NOT EXISTS ad_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER,
+    kind         TEXT    NOT NULL,
+    status       TEXT    DEFAULT 'pending',
+    reward       REAL    DEFAULT 0,
+    started_at   TEXT    DEFAULT (datetime('now')),
+    completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ad_views_user_time ON ad_views(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ad_events_user_kind ON ad_events(user_id, kind, completed_at);
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- PERFORMANCE INDEXES
@@ -314,11 +323,31 @@ CREATE INDEX IF NOT EXISTS idx_users_last_seen      ON users(last_seen);
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
+
+-- AdsGram — rewarded video
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', '0');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_block_id', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('monetag_zone_id', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('monetag_sdk_url', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_batch_size', '6');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_min', '1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_skip_max', '3');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_creation_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_min_reward', '1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_reward', '20');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_min_slots', '5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_slots', '500');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_reward_amount', '0.5');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_daily_limit', '10');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '20');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '30');
+
+-- AdsGram — Direct Link
+INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_direct_link', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_reward_amount', '0.3');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_daily_limit', '10');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_wait_seconds', '15');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('direct_link_cooldown_seconds', '30');
 
 INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
@@ -337,6 +366,16 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
     "ALTER TABLE users         ADD COLUMN last_verify_msg_id INTEGER DEFAULT 0",
     "ALTER TABLE users         ADD COLUMN last_seen TEXT DEFAULT ''",
+    # 1 = counts toward the referrer's own "Direct" stat (paid, or the
+    # skip feature is off / this row predates it). Set to 0 only when
+    # referral_skip silently withholds this referral's payout — so a
+    # skipped join never shows up in the referrer's own numbers at all,
+    # not just missing a payout notification.
+    "ALTER TABLE users         ADD COLUMN referral_paid INTEGER DEFAULT 1",
+    "ALTER TABLE tasks         ADD COLUMN created_by    INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN budget_slots  INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN slots_used    INTEGER DEFAULT 0",
+    "ALTER TABLE tasks         ADD COLUMN review_status TEXT DEFAULT 'approved'",
     """CREATE TABLE IF NOT EXISTS fraud_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, reason TEXT, ip_address TEXT,
@@ -405,6 +444,107 @@ class DataEngine:
                 "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?", (amount, user_id)
             )
             await db.commit()
+
+    @staticmethod
+    async def is_referral_skipped(referrer_id: int, position: int) -> bool:
+        """
+        Decides whether the `position`-th (1-indexed) direct referral a
+        given referrer has ever brought in should be paid or silently
+        skipped. Controlled by the referral_skip_* settings.
+
+        Works in fixed-size batches (default 6): within each batch, a
+        random 1-3 (configurable) of the slots are picked to be unpaid.
+        The choice is deterministic per (referrer_id, batch_number) — no
+        extra table needed, and re-computing it always gives the same
+        answer for the same referral, which matters if this is ever
+        called twice for the same person.
+        """
+        enabled = (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1"
+        if not enabled:
+            return False
+        batch_size = max(2, int(await DataEngine.get_setting("referral_skip_batch_size", "6")))
+        skip_min = max(0, int(await DataEngine.get_setting("referral_skip_min", "1")))
+        skip_max = max(skip_min, int(await DataEngine.get_setting("referral_skip_max", "3")))
+        skip_max = min(skip_max, batch_size - 1)  # never skip an entire batch
+
+        batch_number = (position - 1) // batch_size
+        position_in_batch = (position - 1) % batch_size + 1  # 1..batch_size
+
+        rng = random.Random(f"{referrer_id}:{batch_number}:{batch_size}:{skip_min}:{skip_max}")
+        skip_count = rng.randint(skip_min, skip_max)
+        if skip_count <= 0:
+            return False
+        skip_positions = set(rng.sample(range(1, batch_size + 1), skip_count))
+        return position_in_batch in skip_positions
+
+    @staticmethod
+    async def stash_pending_referral(user_id: int, referrer_id: int):
+        """Called from /start the moment we see a ?ref= param — before we
+        know if the person will pass the membership gate or when they'll
+        tap 'Joined'. Written to disk immediately so it isn't lost if the
+        bot restarts while they're still off joining channels."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO pending_referrals (user_id, referrer_id, created_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(user_id) DO UPDATE SET referrer_id=excluded.referrer_id, "
+                "created_at=excluded.created_at",
+                (user_id, referrer_id),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_pending_referral(user_id: int):
+        """Returns the stashed referrer_id if one exists and is recent
+        (7 days — long enough to cover any realistic gap between /start
+        and finishing verification, short enough that a genuinely stale
+        one from months ago isn't wrongly resurrected)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT referrer_id FROM pending_referrals "
+                "WHERE user_id=? AND created_at >= datetime('now','-7 days')",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            return row["referrer_id"] if row else None
+
+    @staticmethod
+    async def clear_pending_referral(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
+            await db.commit()
+
+    @staticmethod
+    async def mark_referral_unpaid(user_id: int):
+        """Called when referral_skip decides this user's join shouldn't be
+        paid out — also hides them from the referrer's own 'Direct' count
+        (see get_paid_referral_metrics), not just from the payout message."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET referral_paid = 0 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    @staticmethod
+    async def get_paid_referral_metrics(user_id: int):
+        """Same shape as get_referral_metrics, but only counts referrals
+        that were actually paid — this is what the referrer themselves
+        should see (bot chat, Mini App Invite tab). Admin-facing views
+        should keep using get_referral_metrics (the true, unfiltered
+        count) since referral_skip's whole point is that only the
+        referrer stays unaware of it."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur1 = await db.execute(
+                "SELECT COUNT(*) FROM users WHERE referred_by = ? AND referral_paid = 1", (user_id,)
+            )
+            direct_count = (await cur1.fetchone())[0] or 0
+            cur2 = await db.execute(
+                "SELECT COUNT(*) FROM users u2 "
+                "JOIN users u1 ON u2.referred_by = u1.user_id "
+                "WHERE u1.referred_by = ? AND u1.referral_paid = 1",
+                (user_id,)
+            )
+            tier2_count = (await cur2.fetchone())[0] or 0
+            return direct_count, tier2_count
 
     @staticmethod
     async def get_referral_metrics(user_id: int):
@@ -498,19 +638,32 @@ class DataEngine:
         canvas_hash: str = "",
         webgl_hash: str = "",
         screen_sig: str = "",
-    ):
+    ) -> bool:
+        """Atomically claims the verification slot for this user_id.
+        verifications.user_id is UNIQUE, and this is a plain INSERT (not
+        OR REPLACE), so if two /api/verify requests for the same uid ever
+        race each other (double-tap, network retry, two tabs...), only
+        ONE of them can succeed here — SQLite serializes the write and
+        rejects the second with an IntegrityError. Returns True only for
+        the call that actually won that race; the caller must treat False
+        as "already verified" and skip account creation / referral payout
+        entirely, so a race can never pay a referral reward twice."""
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO verifications "
-                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
-                "tg_platform, tg_version, tg_app_version, "
-                "canvas_hash, webgl_hash, screen_sig) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (user_id, ip, ua, fingerprint, referrer_ip,
-                 tg_platform, tg_version, tg_app_version,
-                 canvas_hash, webgl_hash, screen_sig),
-            )
-            await db.commit()
+            try:
+                await db.execute(
+                    "INSERT INTO verifications "
+                    "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
+                    "tg_platform, tg_version, tg_app_version, "
+                    "canvas_hash, webgl_hash, screen_sig) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, ip, ua, fingerprint, referrer_ip,
+                     tg_platform, tg_version, tg_app_version,
+                     canvas_hash, webgl_hash, screen_sig),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
 
     @staticmethod
     async def get_verification(user_id: int):
@@ -614,55 +767,39 @@ class DataEngine:
                 raise e
 
     @staticmethod
+    async def deduct_balance_atomic(user_id: int, amount: float) -> bool:
+        """Atomically checks sufficient balance and deducts it in one
+        BEGIN EXCLUSIVE transaction — same pattern as
+        create_withdrawal_atomic. Returns False (deducting nothing) if
+        the balance is insufficient. Without this, a separate
+        SELECT-balance-then-UPDATE check (as user task creation used to
+        do) can be raced by two concurrent requests that both read the
+        same starting balance and both pass the check, overdrawing the
+        account into the negative."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                row = await cur.fetchone()
+                if not row or round(float(row[0]), 2) < round(amount, 2):
+                    await db.execute("ROLLBACK")
+                    return False
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance - ?, 2) WHERE user_id = ?",
+                    (amount, user_id),
+                )
+                await db.execute("COMMIT")
+                return True
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
     async def get_withdrawal(wid: int):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (wid,))
             return await cur.fetchone()
-
-    # ── Rewarded ads (AdsGram) ──────────────────────────────────────────
-    @staticmethod
-    async def get_ad_views_today(user_id: int) -> int:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM ad_views "
-                "WHERE user_id = ? AND date(created_at) = date('now')",
-                (user_id,),
-            )
-            return (await cur.fetchone())[0] or 0
-
-    @staticmethod
-    async def get_seconds_since_last_ad_view(user_id: int) -> float | None:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT (julianday('now') - julianday(created_at)) * 86400.0 "
-                "FROM ad_views WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-            return row[0] if row else None
-
-    @staticmethod
-    async def credit_ad_view(user_id: int, amount: float):
-        """Atomically logs one rewarded-ad view and credits the balance.
-        This is the ONLY place an ad-watch ever turns into money — it is
-        called from our own backend after our own rate-limit checks, never
-        driven directly by anything the browser/ad SDK claims."""
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN EXCLUSIVE")
-            try:
-                await db.execute(
-                    "INSERT INTO ad_views (user_id, amount) VALUES (?, ?)",
-                    (user_id, amount),
-                )
-                await db.execute(
-                    "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
-                    (amount, user_id),
-                )
-                await db.execute("COMMIT")
-            except Exception as e:
-                await db.execute("ROLLBACK")
-                raise e
 
     @staticmethod
     async def update_withdrawal_status(wid: int, status: str, post_id: int = 0, reason: str = ""):
@@ -732,6 +869,201 @@ class DataEngine:
             await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
             await db.commit()
 
+    # ── AdsGram: rewarded video + direct link ──────────────────────────
+    @staticmethod
+    async def count_ad_events_today(user_id: int, kind: str) -> int:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind=? AND status='completed' "
+                "AND date(completed_at) = date('now')",
+                (user_id, kind),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    @staticmethod
+    async def get_last_ad_event(user_id: int, kind: str):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT completed_at FROM ad_events WHERE user_id=? AND kind=? AND status='completed' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                (user_id, kind),
+            )
+            row = await cur.fetchone()
+            return row["completed_at"] if row else None
+
+    @staticmethod
+    async def record_ad_event(user_id: int, kind: str, reward: float):
+        """Straight-to-completed event — used for rewarded video, whose
+        completion is already confirmed client-side by the AdsGram SDK
+        promise before this is ever called."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
+                "VALUES (?, ?, 'completed', ?, datetime('now'))",
+                (user_id, kind, reward),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def claim_video_ad_atomic(
+        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
+    ) -> tuple[bool, str]:
+        """Re-checks the daily cap and cooldown AND records+pays the
+        reward, all inside one BEGIN EXCLUSIVE transaction (same pattern
+        as create_withdrawal_atomic). There's no single row to guard here
+        the way task/direct-link claims can (this is a per-day COUNT, not
+        a status flip on one row), so several /api/ads/claim requests
+        fired at once could otherwise all read the same "watched_today"
+        value before any of them commits, letting the daily cap be
+        bypassed entirely. The exclusive lock serializes that."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
+                    "AND status='completed' AND date(completed_at)=date('now')",
+                    (user_id,),
+                )
+                watched_today = (await cur.fetchone())[0]
+                if watched_today >= daily_limit:
+                    await db.execute("ROLLBACK")
+                    return False, "daily_limit_reached"
+
+                cur2 = await db.execute(
+                    "SELECT completed_at FROM ad_events WHERE user_id=? AND kind='video' "
+                    "AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+                    (user_id,),
+                )
+                last = await cur2.fetchone()
+                if last and last[0]:
+                    try:
+                        elapsed = (datetime.utcnow() - datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                        if elapsed < cooldown_seconds:
+                            await db.execute("ROLLBACK")
+                            return False, "cooldown_active"
+                    except Exception:
+                        pass
+
+                await db.execute(
+                    "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
+                    "VALUES (?, 'video', 'completed', ?, datetime('now'))",
+                    (user_id, reward),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                    (reward, user_id),
+                )
+                await db.execute("COMMIT")
+                return True, ""
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    async def log_ad_click(user_id: int, kind: str):
+        """Lightweight analytics-only row — logged the moment a user taps
+        'Watch Ad' / opens the ad, BEFORE we know whether they'll finish
+        it. Never touched by the reward/daily-limit logic (that only
+        ever counts status='completed'), so this is purely for the
+        admin 'clicks vs completions' dashboard."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status) VALUES (?, ?, 'clicked')",
+                (user_id, kind),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_ads_admin_analytics(video_daily_limit: int, direct_link_daily_limit: int) -> dict:
+        """Admin-facing ad analytics: how many people clicked vs finished
+        today, plus who has hit today's daily limit (with username)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            async def scalar(query, params=()):
+                cur = await db.execute(query, params)
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
+            video_clicks = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='video' AND status='clicked' AND date(started_at)=date('now')"
+            )
+            video_completed = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='video' AND status='completed' AND date(completed_at)=date('now')"
+            )
+            dl_opened = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='direct_link' AND date(started_at)=date('now')"
+            )
+            dl_completed = await scalar(
+                "SELECT COUNT(DISTINCT user_id) FROM ad_events "
+                "WHERE kind='direct_link' AND status='completed' AND date(completed_at)=date('now')"
+            )
+
+            async def limit_reached(kind: str, limit: int):
+                cur = await db.execute(
+                    "SELECT u.user_id, u.username, u.full_name, COUNT(*) AS watched "
+                    "FROM ad_events e JOIN users u ON u.user_id = e.user_id "
+                    "WHERE e.kind=? AND e.status='completed' AND date(e.completed_at)=date('now') "
+                    "GROUP BY e.user_id HAVING watched >= ? ORDER BY watched DESC",
+                    (kind, limit),
+                )
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+            video_limit_users = await limit_reached("video", video_daily_limit)
+            dl_limit_users    = await limit_reached("direct_link", direct_link_daily_limit)
+
+            return {
+                "video_clicks_today":              video_clicks,
+                "video_completed_today":            video_completed,
+                "direct_link_opened_today":          dl_opened,
+                "direct_link_completed_today":       dl_completed,
+                "video_limit_reached_users":         video_limit_users,
+                "direct_link_limit_reached_users":   dl_limit_users,
+            }
+
+    @staticmethod
+    async def start_ad_event(user_id: int, kind: str) -> int:
+        """Opens a 'pending' event — used for Direct Link, which has no
+        SDK callback, so we gate the reward behind a server-side wait
+        timer instead (same trust model as 'fake' tasks)."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT INTO ad_events (user_id, kind, status) VALUES (?, ?, 'pending')",
+                (user_id, kind),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    @staticmethod
+    async def get_ad_event(event_id: int, user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM ad_events WHERE id=? AND user_id=?", (event_id, user_id)
+            )
+            return await cur.fetchone()
+
+    @staticmethod
+    async def complete_ad_event(event_id: int, reward: float) -> bool:
+        """Atomically transitions an ad_events row to 'completed'. Returns
+        True only for the call that actually performs that transition —
+        the WHERE guard means a concurrent/duplicate claim for the same
+        event_id can never both succeed, closing a double-reward race."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE ad_events SET status='completed', reward=?, completed_at=datetime('now') "
+                "WHERE id=? AND status != 'completed'",
+                (reward, event_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     @staticmethod
     async def remove_force_channel(row_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -750,17 +1082,61 @@ class DataEngine:
 
     # ── TASK SYSTEM ─────────────────────────────────────────────────────────
     @staticmethod
-    async def create_task(title: str, channel_id: str, invite_link: str, task_type: str, reward: float) -> int:
+    async def create_task(title: str, channel_id: str, invite_link: str, task_type: str, reward: float,
+                           created_by: int = 0, budget_slots: int = 0, review_status: str = "approved") -> int:
+        # Admin-created tasks (created_by=0) publish immediately (is_active=1).
+        # User-created tasks start pending review (is_active=0) until an
+        # admin approves them — this stops a scam/spam channel going live
+        # while an admin's balance is already sitting in escrow for it.
+        is_active = 1 if review_status == "approved" else 0
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM tasks")
             pos = (await cur.fetchone())[0]
             cur2 = await db.execute(
-                "INSERT INTO tasks (title, channel_id, invite_link, task_type, reward, position) "
-                "VALUES (?,?,?,?,?,?)",
-                (title, channel_id, invite_link, task_type, reward, pos),
+                "INSERT INTO tasks (title, channel_id, invite_link, task_type, reward, position, "
+                "created_by, budget_slots, slots_used, review_status, is_active) "
+                "VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+                (title, channel_id, invite_link, task_type, reward, pos,
+                 created_by, budget_slots, review_status, is_active),
             )
             await db.commit()
             return cur2.lastrowid
+
+    @staticmethod
+    async def get_user_tasks(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM tasks WHERE created_by = ? ORDER BY id DESC", (user_id,)
+            )
+            return await cur.fetchall()
+
+    @staticmethod
+    async def get_pending_review_tasks():
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM tasks WHERE review_status = 'pending' ORDER BY id ASC"
+            )
+            return await cur.fetchall()
+
+    @staticmethod
+    async def increment_task_slot(task_id: int) -> bool:
+        """
+        Records that one more person completed a user-created task's slot.
+        Auto-deactivates the task once its paid-for budget is fully used.
+        Returns True if this call sold out the last slot.
+        """
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("UPDATE tasks SET slots_used = slots_used + 1 WHERE id = ?", (task_id,))
+            cur = await db.execute("SELECT slots_used, budget_slots FROM tasks WHERE id = ?", (task_id,))
+            row = await cur.fetchone()
+            sold_out = bool(row and row["budget_slots"] > 0 and row["slots_used"] >= row["budget_slots"])
+            if sold_out:
+                await db.execute("UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,))
+            await db.commit()
+            return sold_out
 
     @staticmethod
     async def get_tasks(active_only: bool = True):
@@ -784,7 +1160,8 @@ class DataEngine:
     async def update_task(task_id: int, **fields):
         if not fields:
             return
-        allowed = {"title", "channel_id", "invite_link", "task_type", "reward", "is_active", "position"}
+        allowed = {"title", "channel_id", "invite_link", "task_type", "reward", "is_active", "position",
+                   "budget_slots", "slots_used", "review_status"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
             return
@@ -793,6 +1170,42 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(f"UPDATE tasks SET {cols} WHERE id = ?", vals)
             await db.commit()
+
+    @staticmethod
+    async def cancel_user_task_atomic(task_id: int, created_by: int) -> tuple[bool, float]:
+        """Atomically flips a task to 'cancelled' and pays its refund, all
+        in one BEGIN EXCLUSIVE transaction. Without this, two concurrent
+        /api/tasks/cancel calls for the same task could both read
+        review_status='approved' before either commits, and both pay out
+        a refund for the same unused slots."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT created_by, review_status, budget_slots, slots_used, reward "
+                    "FROM tasks WHERE id=?", (task_id,)
+                )
+                row = await cur.fetchone()
+                if not row or row[0] != created_by or row[1] not in ("pending", "approved"):
+                    await db.execute("ROLLBACK")
+                    return False, 0.0
+                budget_slots, slots_used, reward = row[2], row[3], row[4]
+                unused_slots = max(0, int(budget_slots) - int(slots_used))
+                refund = round(unused_slots * float(reward), 2)
+                await db.execute(
+                    "UPDATE tasks SET is_active=0, review_status='cancelled' WHERE id=?",
+                    (task_id,),
+                )
+                if refund > 0:
+                    await db.execute(
+                        "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                        (refund, created_by),
+                    )
+                await db.execute("COMMIT")
+                return True, refund
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
 
     @staticmethod
     async def delete_task(task_id: int):
@@ -839,14 +1252,35 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
-    async def mark_task_completed(user_id: int, task_id: int):
+    async def mark_task_checked(user_id: int, task_id: int):
+        # Only a user who has passed a *real* verification (membership
+        # confirmed, or wait-timer elapsed for a fake task) is allowed to
+        # move from 'joined' -> 'checked'. /api/tasks/claim requires this
+        # status before it will pay out, so the reward can never be
+        # farmed by calling /api/tasks/claim directly and skipping /check.
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE task_progress SET status='completed', completed_at=datetime('now') "
-                "WHERE user_id = ? AND task_id = ?",
+                "UPDATE task_progress SET status='checked' WHERE user_id = ? AND task_id = ? AND status = 'joined'",
                 (user_id, task_id),
             )
             await db.commit()
+
+    @staticmethod
+    async def mark_task_completed(user_id: int, task_id: int) -> bool:
+        """Atomically transitions task_progress 'checked' -> 'completed'.
+        Returns True only for the call that actually performs that
+        transition. If two /api/tasks/claim requests for the same task
+        race each other (double-tap, retry), the guarded WHERE means only
+        one UPDATE can ever match a row — the other gets rowcount 0 and
+        must not pay out, closing a double-reward race."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE task_progress SET status='completed', completed_at=datetime('now') "
+                "WHERE user_id = ? AND task_id = ? AND status='checked'",
+                (user_id, task_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FRAUD DETECTION ENGINE  (v5 — correlation-based)
@@ -1111,6 +1545,76 @@ bot         = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp          = Dispatcher(storage=MemoryStorage())
 core_router = Router()
 
+# ── Shared "invite card" builder — used both by /api/invite/share_card
+#    (sends it straight into the user's own chat with the bot) and by the
+#    inline_query handler below (lets the user pick a friend/group from
+#    Telegram's native chat list and have it delivered there directly).
+_bot_photo_file_id: str | None = None  # cached after first lookup
+
+
+async def _get_bot_photo_file_id() -> str | None:
+    global _bot_photo_file_id
+    if _bot_photo_file_id:
+        return _bot_photo_file_id
+    try:
+        photos = await bot.get_user_profile_photos(BOT_ID or (await bot.get_me()).id, limit=1)
+        if photos.total_count > 0:
+            _bot_photo_file_id = photos.photos[0][-1].file_id  # largest size
+    except Exception:
+        pass
+    return _bot_photo_file_id
+
+
+async def _build_invite_card(uid: int):
+    uname = BOT_USERNAME or (await bot.get_me()).username
+    referral_link = f"https://t.me/{uname}?start={uid}"
+    caption = (
+        "🎉 <b>I'm earning real money with this bot — and you can too!</b>\n\n"
+        "✅ Complete simple tasks\n"
+        "✅ Watch short ads\n"
+        "✅ Invite friends for bonus rewards\n"
+        "✅ Withdraw straight to Telebirr\n\n"
+        "Tap the button below to join — it only takes a minute 👇"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Join & Start Earning", url=referral_link)],
+    ])
+    photo_id = await _get_bot_photo_file_id()
+    return caption, kb, photo_id
+
+
+@core_router.inline_query()
+async def handle_invite_inline_query(inline_query: InlineQuery):
+    """
+    Powers "Share with Friends": the Mini App calls tg.switchInlineQuery(),
+    the user picks a friend/group from Telegram's native chat picker, and
+    Telegram calls this handler to ask what to actually send there.
+
+    This matters because a manually-forwarded copy of a bot message loses
+    its inline keyboard — Telegram only keeps buttons on messages sent
+    live by the bot. Answering an inline query IS the bot sending the
+    message directly into that chat (just triggered through the picker
+    instead of a /start), so the photo + button both survive. This is the
+    same mechanism most invite/referral bots rely on for exactly that reason.
+    """
+    caption, kb, photo_id = await _build_invite_card(inline_query.from_user.id)
+    if photo_id:
+        result = InlineQueryResultCachedPhoto(
+            id=str(inline_query.from_user.id), photo_file_id=photo_id,
+            caption=caption, reply_markup=kb,
+        )
+    else:
+        result = InlineQueryResultArticle(
+            id=str(inline_query.from_user.id), title="📤 Share your invite",
+            description="Tap to send your invite card with a Join button",
+            input_message_content=InputTextMessageContent(message_text=caption),
+            reply_markup=kb,
+        )
+    try:
+        await bot.answer_inline_query(inline_query.id, results=[result], cache_time=0, is_personal=True)
+    except Exception as e:
+        logger.warning(f"answer_inline_query failed: {e}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DEBUG: catch-all callback logger
 #
@@ -1228,6 +1732,10 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
     s   = await state.get_data()
     ref = s.get("stashed_referrer_id", 0)
     await state.clear()
+    if not ref:
+        # FSM memory is gone (bot restarted while they were off joining
+        # channels) — recover the referrer from the durable DB stash instead.
+        ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
         await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
@@ -1256,6 +1764,13 @@ async def process_start_command(message: Message, state: FSMContext):
     args = message.text.split()
     arg  = args[1] if len(args) > 1 else ""
     ref  = int(arg) if arg.isdigit() and int(arg) != uid else 0
+
+    if ref:
+        # Written to disk immediately — the membership-gate wait that
+        # follows can take anywhere from seconds to hours, and the old
+        # FSMContext-only stash below doesn't survive a bot restart in
+        # that window. This does.
+        await DataEngine.stash_pending_referral(uid, ref)
 
     acc = await DataEngine.get_user(uid)
     if acc and acc["is_banned"]:
@@ -1334,7 +1849,7 @@ async def process_referral_query(callback: CallbackQuery):
     if not await DataEngine.is_verified(uid):
         if not await enforce_membership_gate(callback, uid):
             return
-    direct, _    = await DataEngine.get_referral_metrics(uid)
+    direct, _    = await DataEngine.get_paid_referral_metrics(uid)
     rate         = float(await DataEngine.get_setting("reward_per_referral", "10"))
     me           = await bot.get_me()
     link         = f"https://t.me/{me.username}?start={uid}"
@@ -1489,6 +2004,7 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🚫 Ban User",            callback_data="adm_cmd_ban"),
             InlineKeyboardButton(text="✅ Unban Dashboard",     callback_data="adm_cmd_unban_menu"),
         ],
+        [InlineKeyboardButton(text="💾 Backup DB Now",         callback_data="adm_cmd_backup_now")],
         [InlineKeyboardButton(text="🛑 STOP BOT ENGINE",        callback_data="adm_stop_bot_confirm1")],
         [InlineKeyboardButton(text="🔙 Back to Main Menu",      callback_data="ui_return_home")],
     ])
@@ -1600,6 +2116,10 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
         return {"status": "error", "reason": "insufficient_funds"}
 
     user = await DataEngine.get_user(uid)
+    me   = await bot.get_me()
+    proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
+    ]])
 
     post_id = 0
     if PAYMENT_LOG_CHANNEL:
@@ -1616,7 +2136,7 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
                 f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            receipt = await bot.send_message(PAYMENT_LOG_CHANNEL, txt)
+            receipt = await bot.send_message(PAYMENT_LOG_CHANNEL, txt, reply_markup=proof_channel_keyboard)
             post_id = receipt.message_id
             await DataEngine.update_withdrawal_status(tid, "pending", post_id)
         except Exception as e:
@@ -1639,7 +2159,12 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve (ይለቀቅ)",  callback_data=f"adm_payout_ap_{tid}"),
+            InlineKeyboardButton(text="✅ Approve (Both)",  callback_data=f"adm_payout_ap_{tid}"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Approve (Channel Only)", callback_data=f"adm_payout_apco_{tid}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Deny (ውድቅ አድርግ)", callback_data=f"adm_payout_rjmenu_{tid}"),
         ],
         [InlineKeyboardButton(text="👥 View Referrals", callback_data=f"adm_view_invites_{uid}")]
@@ -1731,20 +2256,24 @@ async def process_fraud_log(callback: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — APPROVE WITHDRAWAL
 # ─────────────────────────────────────────────────────────────────────────────
-async def approve_withdrawal_core(tid: int) -> dict:
+async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
     """
     Shared approval logic used by BOTH the bot-chat inline button and the
     Mini App REST endpoint (/api/admin/withdrawals/approve), so there's
     exactly one place that posts the Telebirr proof photo and notifies
     the user.
+
+    notify_mode:
+      "both"          — post proof to the channel AND DM the user (default)
+      "channel_only"  — post proof to the channel only, no DM to the user
     """
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending":
         return {"ok": False, "reason": "already_processed"}
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     me = await bot.get_me()
-    bot_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"🚀 @{me.username}", url=f"https://t.me/{me.username}")
+    proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         txt = (
@@ -1762,7 +2291,7 @@ async def approve_withdrawal_core(tid: int) -> dict:
                 photo=TELEBIRR_PROOF_IMAGE,
                 caption=txt,
                 reply_to_message_id=ticket["channel_post_id"],
-                reply_markup=bot_keyboard
+                reply_markup=proof_channel_keyboard
             )
         except Exception as e:
             logger.error(f"Proof Photo Error: {e}")
@@ -1771,17 +2300,18 @@ async def approve_withdrawal_core(tid: int) -> dict:
                     chat_id=PAYMENT_LOG_CHANNEL,
                     text=txt,
                     reply_to_message_id=ticket["channel_post_id"],
-                    reply_markup=bot_keyboard
+                    reply_markup=proof_channel_keyboard
                 )
             except Exception as e2:
                 logger.error(f"Proof Text Fallback Error: {e2}")
-    try:
-        await bot.send_message(
-            ticket["user_id"],
-            f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
-        )
-    except Exception:
-        pass
+    if notify_mode != "channel_only":
+        try:
+            await bot.send_message(
+                ticket["user_id"],
+                f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
+            )
+        except Exception:
+            pass
     return {"ok": True}
 
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
@@ -1789,10 +2319,23 @@ async def process_admin_approval(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id):
         return
     tid    = int(callback.data.split("_")[3])
-    result = await approve_withdrawal_core(tid)
+    result = await approve_withdrawal_core(tid, notify_mode="both")
     if not result["ok"]:
         return await callback.answer("Already processed.")
-    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved (Both notified).")
+    await callback.answer()
+
+
+@core_router.callback_query(F.data.startswith("adm_payout_apco_"))
+async def process_admin_approval_channel_only(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id):
+        return
+    tid    = int(callback.data.split("_")[3])
+    result = await approve_withdrawal_core(tid, notify_mode="channel_only")
+    if not result["ok"]:
+        return await callback.answer("Already processed.")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved (Channel only — user not DMed).")
+    await callback.answer()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — REJECT WITHDRAWAL
@@ -1844,10 +2387,30 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
     await execute_withdrawal_rejection(message, tid, ticket, message.text.strip())
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
-    await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
-    # Refund the reserved balance back to the user — it was deducted
-    # atomically at request time in create_withdrawal_atomic().
-    await DataEngine.add_balance(ticket["user_id"], float(ticket["amount"]))
+    # Atomic re-check-and-refund: the caller's own "status == pending"
+    # check above can be raced (double-tap, two admins), so this is the
+    # actual guard against refunding the same ticket's reserved balance
+    # twice — status flip and balance credit happen in one transaction.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN EXCLUSIVE")
+        try:
+            cur = await db.execute("SELECT status FROM withdrawals WHERE id=?", (tid,))
+            row = await cur.fetchone()
+            if not row or row[0] != "pending":
+                await db.execute("ROLLBACK")
+                return
+            await db.execute(
+                "UPDATE withdrawals SET status='rejected', channel_post_id=?, reason=?, resolved_at=datetime('now') WHERE id=?",
+                (ticket["channel_post_id"], reason, tid),
+            )
+            await db.execute(
+                "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                (float(ticket["amount"]), ticket["user_id"]),
+            )
+            await db.execute("COMMIT")
+        except Exception:
+            await db.execute("ROLLBACK")
+            raise
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected!</b>\n\n"
         f"💰 <b>Amount:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
@@ -1981,6 +2544,7 @@ async def process_rm_channel_action(callback: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 _polling_task: asyncio.Task | None = None
 BOT_USERNAME: str = ""
+BOT_ID: int = 0
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
@@ -2063,6 +2627,19 @@ async def process_stats(callback: CallbackQuery):
         f"• Outstanding Liabilities: <b>{float(row[1] or 0.0):.2f} ETB</b>\n"
         f"• Banned IPs: <b>{ip_count}</b>\n"
         f"• Fraud Log Entries: <b>{fraud_count}</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
+
+@core_router.callback_query(F.data == "adm_cmd_backup_now")
+async def process_backup_now(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    if not DB_BACKUP_CHANNEL_ID:
+        await callback.answer("⚠️ DB_BACKUP_CHANNEL_ID is not set in Railway Variables.", show_alert=True)
+        return
+    await callback.answer("📤 Sending backup…")
+    await send_db_backup()
+    await callback.message.edit_text(
+        "✅ <b>Backup sent</b> to your private backup channel.",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -2363,15 +2940,28 @@ class ApiBase(BaseModel):
 
 async def _authenticate(body: ApiBase) -> dict:
     """Validates Telegram WebApp initData and returns the users-table row
-    as a plain dict. Creates the user row on first contact (mirrors what
-    /start does on the bot side) and bumps last_seen for the online-users
-    stat. Raises 401 for a bad signature and 403 for a banned account."""
+    as a plain dict. Raises 403 'not_verified' if this user has never
+    completed /api/verify — this is what actually enforces the channel
+    gate, fingerprint/VPN/clone-risk checks, and referral attribution,
+    since none of those run anywhere else. Without this check, anyone
+    opening app.html directly (Telegram's native bot-profile "Open App"
+    button, or any other direct link) would get a fully working, fully
+    unverified account with zero fraud checks and no referrer ever
+    attributed — the entire index.html verification flow would be
+    optional rather than required."""
     tg_user = parse_telegram_webapp_handshake(body.initData)
     if not tg_user or "id" not in tg_user:
         raise HTTPException(status_code=401, detail="invalid_init_data")
     user_id = int(tg_user["id"])
+    if not await DataEngine.is_verified(user_id):
+        raise HTTPException(status_code=403, detail="not_verified")
     row = await DataEngine.get_user(user_id)
     if not row:
+        # Verified (has a verifications row) but somehow missing its users
+        # row — self-heal instead of crashing, same pattern used elsewhere
+        # (e.g. the admin "Full Unban" path). No referrer here since a
+        # genuinely fresh signup would have gone through /api/verify,
+        # which always creates the users row itself.
         full_name = (
             f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip()
             or tg_user.get("username", "") or str(user_id)
@@ -2471,6 +3061,8 @@ async def api_verify(body: VerifyRequest, request: Request):
 
     uid = body.uid
     ref = body.refId if body.refId and body.refId != uid else 0
+    if not ref:
+        ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
         return {"status": "already_verified"}
@@ -2506,9 +3098,27 @@ async def api_verify(body: VerifyRequest, request: Request):
             await DataEngine.ban_ip(client_ip, reason)
         return {"status": "blocked", "reason": reason}
 
-    # Passed every check — create the account (linking the referrer only
-    # on first creation), save the verification fingerprint, start the IP
-    # cooldown window, and pay the referrer's bonus.
+    # Passed every check — atomically claim the verification slot FIRST.
+    # This is the actual guard against double-paying a referral: if a
+    # duplicate/concurrent request for this exact uid is racing this one
+    # (double-tap, retry, two tabs), only one of the two INSERTs below can
+    # win. The loser returns immediately, before touching the account or
+    # the referrer's balance at all.
+    claimed = await DataEngine.save_verification(
+        uid, client_ip, body.ua, body.fingerprint,
+        referrer_ip="", tg_platform=body.tgPlatform, tg_version=body.tgVersion,
+        tg_app_version=body.tgAppVersion, canvas_hash=body.canvasHash,
+        webgl_hash=body.webglHash, screen_sig=body.screenSig,
+    )
+    if not claimed:
+        return {"status": "already_verified"}
+
+    await ip_cooldown.mark_verified(client_ip)
+
+    # Create the account (linking the referrer only on first creation) and
+    # pay the referrer's bonus — safe now, since `claimed` above guarantees
+    # this is the one and only request that will ever reach this point for
+    # this uid.
     referrer_row = await DataEngine.get_user(ref) if ref else None
     referred_by = ref if referrer_row else None
 
@@ -2519,25 +3129,32 @@ async def api_verify(body: VerifyRequest, request: Request):
             or tg_user.get("username", "") or str(uid)
         )
         await DataEngine.create_user(uid, tg_user.get("username", "") or "", full_name, referred_by)
-
-    await DataEngine.save_verification(
-        uid, client_ip, body.ua, body.fingerprint,
-        referrer_ip="", tg_platform=body.tgPlatform, tg_version=body.tgVersion,
-        tg_app_version=body.tgAppVersion, canvas_hash=body.canvasHash,
-        webgl_hash=body.webglHash, screen_sig=body.screenSig,
-    )
-    await ip_cooldown.mark_verified(client_ip)
+    if ref:
+        # Used (or superseded by an existing account) — clear it either way
+        # so it doesn't linger and get picked up by some unrelated future flow.
+        await DataEngine.clear_pending_referral(uid)
 
     if referred_by:
-        rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
-        await DataEngine.add_balance(referred_by, rate)
-        try:
-            await bot.send_message(
-                referred_by,
-                f"🎉 Someone joined using your referral link! +{rate:.2f} Birr credited to your balance."
-            )
-        except Exception:
-            pass
+        direct_count, _ = await DataEngine.get_referral_metrics(referred_by)
+        # direct_count already includes the referral we just created above,
+        # so it IS this referral's 1-indexed position for this referrer.
+        skipped = await DataEngine.is_referral_skipped(referred_by, direct_count)
+        if not skipped:
+            rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+            await DataEngine.add_balance(referred_by, rate)
+            try:
+                await bot.send_message(
+                    referred_by,
+                    f"🎉 Someone joined using your referral link! +{rate:.2f} Birr credited to your balance."
+                )
+            except Exception:
+                pass
+        else:
+            # Not paid — and hidden from the referrer's own "Direct" count
+            # too (get_paid_referral_metrics), so the skip pattern stays
+            # invisible to them in every number they can see, not just in
+            # the missing payout message.
+            await DataEngine.mark_referral_unpaid(uid)
 
     if body.msgId:
         try:
@@ -2559,7 +3176,7 @@ async def api_verify(body: VerifyRequest, request: Request):
 @api_app.post("/api/me")
 async def api_me(body: ApiBase):
     user = await _authenticate(body)
-    direct, tier2 = await DataEngine.get_referral_metrics(user["user_id"])
+    direct, tier2 = await DataEngine.get_paid_referral_metrics(user["user_id"])
     rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
     uname = BOT_USERNAME or (await bot.get_me()).username
@@ -2573,7 +3190,44 @@ async def api_me(body: ApiBase):
         "total_earned_refs": round(direct * rate, 2),
         "referral_link": f"https://t.me/{uname}?start={user['user_id']}",
         "is_admin": evaluate_admin_access(user["user_id"]),
+        "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
+
+
+# ── /api/invite/share_card — sends the user a ready-to-forward invite
+#    message (bot's photo + a written invite caption + an inline button
+#    holding their referral link) in their own chat with the bot, so they
+#    can just long-press → Forward it straight to friends. ────────────────
+SHARE_CARD_COOLDOWN_SECONDS = 25 * 60
+
+
+@api_app.post("/api/invite/share_card")
+async def api_invite_share_card(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    last_at = await DataEngine.get_last_ad_event(uid, "share_card")
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            remaining = int(SHARE_CARD_COOLDOWN_SECONDS - elapsed)
+            if remaining > 0:
+                raise HTTPException(status_code=400, detail=f"cooldown:{remaining}")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # bad timestamp format — don't block the user over it
+
+    caption, kb, photo_id = await _build_invite_card(uid)
+    try:
+        if photo_id:
+            await bot.send_photo(chat_id=uid, photo=photo_id, caption=caption, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=uid, text=caption, reply_markup=kb)
+    except Exception:
+        raise HTTPException(status_code=503, detail="send_failed")
+    await DataEngine.record_ad_event(uid, "share_card", 0)
+    return {"ok": True}
 
 
 # ── /api/gate/* — force-join gate ────────────────────────────────────────
@@ -2599,6 +3253,187 @@ async def api_gate_fake_seen(body: ApiBase):
     user = await _authenticate(body)
     await DataEngine.mark_fake_join_seen(user["user_id"])
     return {"ok": True}
+
+
+# ── /api/ads/* — AdsGram rewarded video + Direct Link ────────────────────
+AD_KIND_VIDEO  = "video"
+AD_KIND_DIRECT = "direct_link"
+
+
+class AdClickRequest(ApiBase):
+    kind: str = "video"
+
+
+@api_app.post("/api/ads/click")
+async def api_ads_click(body: AdClickRequest):
+    """Fire-and-forget analytics ping — called the instant the user taps
+    'Watch Ad', before we know if they'll actually finish it. Purely for
+    the admin 'clicks vs completions' dashboard; never affects rewards
+    or daily limits."""
+    user = await _authenticate(body)
+    kind = body.kind if body.kind in (AD_KIND_VIDEO, AD_KIND_DIRECT) else AD_KIND_VIDEO
+    await DataEngine.log_ad_click(user["user_id"], kind)
+    return {"ok": True}
+
+
+@api_app.post("/api/ads/status")
+async def api_ads_status(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled      = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    block_id         = await DataEngine.get_setting("adsgram_block_id", "") or ""
+    reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+    daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
+    seconds_left = 0
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_VIDEO)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            seconds_left = max(0, int(cooldown_seconds - elapsed))
+        except Exception:
+            pass
+
+    direct_link         = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    dl_reward           = float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"))
+    dl_daily_limit       = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    dl_wait_seconds      = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+    dl_cooldown_seconds  = int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"))
+    dl_watched_today     = await DataEngine.count_ad_events_today(uid, AD_KIND_DIRECT)
+    dl_seconds_left = 0
+    dl_last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_DIRECT)
+    if dl_last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(dl_last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            dl_seconds_left = max(0, int(dl_cooldown_seconds - elapsed))
+        except Exception:
+            pass
+
+    # Monetag — fallback rewarded network, tried client-side only when
+    # AdsGram reports no fill. Doesn't have its own limit/cooldown; it
+    # shares the video ad's daily_limit/cooldown/reward above.
+    monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    monetag_sdk_url = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
+
+    return {
+        "enabled": ads_enabled and bool(block_id or monetag_zone_id),
+        "block_id": block_id,
+        "reward_amount": reward_amount,
+        "daily_limit": daily_limit,
+        "watched_today": watched_today,
+        "seconds_left": seconds_left,
+        "monetag": {
+            "zone_id": monetag_zone_id,
+            "sdk_url": monetag_sdk_url,
+        },
+        "direct_link": {
+            "enabled": ads_enabled and bool(direct_link),
+            "url": direct_link,
+            "reward_amount": dl_reward,
+            "daily_limit": dl_daily_limit,
+            "watched_today": dl_watched_today,
+            "seconds_left": dl_seconds_left,
+            "wait_seconds": dl_wait_seconds,
+        },
+    }
+
+
+@api_app.post("/api/ads/claim")
+async def api_ads_claim(body: ApiBase):
+    """Rewarded video — the AdsGram SDK promise on the frontend already
+    confirmed the ad played to completion before this is ever called, so
+    we only need to re-check the daily cap / cooldown server-side (the
+    SDK promise resolving is not, by itself, something to trust for
+    payouts — a compromised client could call this directly)."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    block_id = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
+    monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    if not ads_enabled or not (block_id or monetag_zone_id):
+        raise HTTPException(status_code=400, detail="ads_disabled")
+
+    daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
+    reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+
+    ok, reason = await DataEngine.claim_video_ad_atomic(uid, reward_amount, daily_limit, cooldown_seconds)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+    return {"credited": reward_amount}
+
+
+@api_app.post("/api/ads/direct-link/open")
+async def api_ads_direct_link_open(body: ApiBase):
+    """Direct Link has no SDK callback to confirm anything happened, so
+    the reward is gated behind a server-timed wait (same trust model as
+    the 'fake' task type already used for unverifiable channel joins)."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    direct_link = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    if not ads_enabled or not direct_link:
+        raise HTTPException(status_code=400, detail="direct_link_disabled")
+
+    daily_limit      = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"))
+    wait_seconds     = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_DIRECT)
+    if watched_today >= daily_limit:
+        raise HTTPException(status_code=400, detail="daily_limit_reached")
+
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_DIRECT)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HTTPException(status_code=400, detail="cooldown_active")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    event_id = await DataEngine.start_ad_event(uid, AD_KIND_DIRECT)
+    return {"url": direct_link, "event_id": event_id, "wait_seconds": wait_seconds}
+
+
+class AdDirectLinkClaimRequest(ApiBase):
+    event_id: int
+
+
+@api_app.post("/api/ads/direct-link/claim")
+async def api_ads_direct_link_claim(body: AdDirectLinkClaimRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    wait_seconds  = int(await DataEngine.get_setting("direct_link_wait_seconds", "15"))
+    reward_amount = float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"))
+
+    event = await DataEngine.get_ad_event(body.event_id, uid)
+    if not event or event["kind"] != AD_KIND_DIRECT or event["status"] == "completed":
+        raise HTTPException(status_code=400, detail="not_claimable")
+
+    try:
+        started_dt = datetime.strptime(event["started_at"], "%Y-%m-%d %H:%M:%S")
+        elapsed = (datetime.utcnow() - started_dt).total_seconds()
+    except Exception:
+        elapsed = wait_seconds
+
+    if elapsed < wait_seconds:
+        raise HTTPException(status_code=400, detail=f"wait:{int(wait_seconds - elapsed)}")
+
+    claimed = await DataEngine.complete_ad_event(body.event_id, reward_amount)
+    if not claimed:
+        raise HTTPException(status_code=400, detail="not_claimable")
+    await DataEngine.add_balance(uid, reward_amount)
+    fresh = await DataEngine.get_user(uid)
+    return {"credited": reward_amount, "balance": float(fresh["balance"])}
 
 
 # ── /api/tasks — user-facing task list + join/check/claim ───────────────
@@ -2629,7 +3464,17 @@ async def _build_task_view(user_id: int) -> list:
 @api_app.post("/api/tasks")
 async def api_tasks(body: ApiBase):
     user = await _authenticate(body)
-    return {"tasks": await _build_task_view(user["user_id"])}
+    return {
+        "tasks": await _build_task_view(user["user_id"]),
+        "user_task_config": {
+            "enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
+            "min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
+            "max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
+            "min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
+            "max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
+            "bot_username": BOT_USERNAME,
+        },
+    }
 
 
 class TaskActionRequest(ApiBase):
@@ -2676,6 +3521,11 @@ async def api_tasks_check(body: TaskActionRequest):
             # legitimate user over a misconfigured channel (same policy
             # as inspect_compulsory_memberships above).
             pass
+    # Only reachable once the wait timer has elapsed AND (for a "force"
+    # task) real membership has been confirmed above. Record that this
+    # user has passed a genuine check — /api/tasks/claim will refuse to
+    # pay out without this, so a reward is never handed out for free.
+    await DataEngine.mark_task_checked(uid, body.task_id)
     return {"ok": True}
 
 
@@ -2689,10 +3539,167 @@ async def api_tasks_claim(body: TaskActionRequest):
     prog = await DataEngine.get_task_progress(uid, body.task_id)
     if not prog or prog["status"] == "completed":
         raise HTTPException(status_code=400, detail="not_claimable")
-    await DataEngine.mark_task_completed(uid, body.task_id)
+    if prog["status"] != "checked":
+        # Guards against calling /api/tasks/claim directly (skipping
+        # /api/tasks/check) to collect a reward without ever actually
+        # joining / passing verification.
+        raise HTTPException(status_code=400, detail="not_checked")
+    claimed = await DataEngine.mark_task_completed(uid, body.task_id)
+    if not claimed:
+        # Lost a race to a concurrent/duplicate claim for this exact task
+        # (or the prior checks above were stale by the time we got here) —
+        # do not pay out a second time.
+        raise HTTPException(status_code=400, detail="not_claimable")
     await DataEngine.add_balance(uid, float(task["reward"]))
+    # If this is a user-created (escrow-funded) task, count the slot the
+    # creator already paid for at creation time — the reward above came
+    # from that escrow, not from a fresh mint of balance.
+    if task["created_by"]:
+        sold_out = await DataEngine.increment_task_slot(body.task_id)
+        if sold_out:
+            try:
+                await bot.send_message(
+                    task["created_by"],
+                    f"🎯 Your task \"{task['title']}\" has reached its target — "
+                    f"all {task['budget_slots']} people have joined. It's now removed from the task list."
+                )
+            except Exception:
+                pass
     fresh = await DataEngine.get_user(uid)
     return {"status": "completed", "reward": float(task["reward"]), "balance": float(fresh["balance"])}
+
+
+# ── /api/tasks/create — users pay from their own balance to advertise
+#    their own channel as a task other users can complete ─────────────────
+class UserTaskCreateRequest(ApiBase):
+    title: str
+    invite_link: str
+    reward: float = Field(gt=0)
+    budget_slots: int = Field(gt=0)
+    channel_id: str = ""  # if set, we re-verify bot-admin status server-side
+
+
+# ── /api/tasks/verify_admin — step 1 of self-serve task creation: confirm
+#    the bot has actually been made admin in the user's channel before
+#    letting them create a real ("force") verified task ───────────────────
+class VerifyAdminRequest(ApiBase):
+    channel_id: str
+
+
+@api_app.post("/api/tasks/verify_admin")
+async def api_tasks_verify_admin(body: VerifyAdminRequest):
+    await _authenticate(body)
+    channel_id = body.channel_id.strip()
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="missing_channel")
+    bot_id = BOT_ID
+    if not bot_id:
+        try:
+            bot_id = (await bot.get_me()).id
+        except Exception:
+            raise HTTPException(status_code=503, detail="bot_unavailable")
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=bot_id)
+        is_admin = member.status in ("administrator", "creator")
+    except Exception:
+        # Channel not found, bot not in it at all, wrong ID format, etc.
+        is_admin = False
+    # Best-effort — works for any public channel regardless of admin
+    # status, so the user never has to type the channel name themselves.
+    title = None
+    try:
+        chat = await bot.get_chat(chat_id=channel_id)
+        title = (chat.title or "").strip() or None
+    except Exception:
+        pass
+    return {"is_admin": is_admin, "bot_username": BOT_USERNAME, "title": title}
+
+
+@api_app.post("/api/tasks/create")
+async def api_tasks_create(body: UserTaskCreateRequest):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    if (await DataEngine.get_setting("user_task_creation_enabled", "0")) != "1":
+        raise HTTPException(status_code=400, detail="feature_disabled")
+
+    title = body.title.strip()[:80]
+    link = body.invite_link.strip()
+    channel_id = body.channel_id.strip()
+    if not title or not link:
+        raise HTTPException(status_code=400, detail="missing_fields")
+    if not link.lower().startswith(("https://t.me/", "http://t.me/", "tg://")):
+        raise HTTPException(status_code=400, detail="invalid_link")
+
+    min_reward = float(await DataEngine.get_setting("user_task_min_reward", "1"))
+    max_reward = float(await DataEngine.get_setting("user_task_max_reward", "20"))
+    min_slots  = int(await DataEngine.get_setting("user_task_min_slots", "5"))
+    max_slots  = int(await DataEngine.get_setting("user_task_max_slots", "500"))
+    if not (min_reward <= body.reward <= max_reward):
+        raise HTTPException(status_code=400, detail="reward_out_of_range")
+    if not (min_slots <= body.budget_slots <= max_slots):
+        raise HTTPException(status_code=400, detail="slots_out_of_range")
+
+    total_cost = round(body.reward * body.budget_slots, 2)
+    fresh = await DataEngine.get_user(uid)
+    if not fresh or float(fresh["balance"]) < total_cost:
+        # Fast, friendly pre-check — the real enforcement is the atomic
+        # deduct right before escrow below, which is race-safe.
+        raise HTTPException(status_code=400, detail="insufficient_balance")
+
+    # Re-verify bot-admin status ourselves — never trust the client's word
+    # for whether the "Check" step passed. If it checks out, this becomes
+    # a real "force" task (genuine membership check on every join);
+    # otherwise it falls back to "fake" (wait-timer only), same as any
+    # admin-made task for a channel the bot isn't in.
+    task_type = "fake"
+    if channel_id:
+        bot_id = BOT_ID or (await bot.get_me()).id
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=bot_id)
+            if member.status in ("administrator", "creator"):
+                task_type = "force"
+        except Exception:
+            pass
+    if task_type != "force":
+        channel_id = ""
+
+    # Escrow the full budget immediately — this is what lets us pay each
+    # completer out of the same pool later without minting new balance.
+    # Atomic re-check-and-deduct: two concurrent /api/tasks/create calls
+    # can no longer both pass the earlier balance check and overdraw it.
+    escrowed = await DataEngine.deduct_balance_atomic(uid, total_cost)
+    if not escrowed:
+        raise HTTPException(status_code=400, detail="insufficient_balance")
+    task_id = await DataEngine.create_task(
+        title, channel_id, link, task_type, body.reward,
+        created_by=uid, budget_slots=body.budget_slots, review_status="pending",
+    )
+    return {"ok": True, "task_id": task_id, "total_cost": total_cost, "status": "pending_review", "task_type": task_type}
+
+
+@api_app.post("/api/tasks/mine")
+async def api_tasks_mine(body: ApiBase):
+    user = await _authenticate(body)
+    rows = await DataEngine.get_user_tasks(user["user_id"])
+    return {"tasks": [dict(r) for r in rows]}
+
+
+@api_app.post("/api/tasks/cancel")
+async def api_tasks_cancel(body: TaskActionRequest):
+    """
+    Lets a creator pull their own task early and get back the escrow for
+    whatever slots haven't been used yet. Can't touch anyone else's task.
+    """
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    task = await DataEngine.get_task(body.task_id)
+    if not task or task["created_by"] != uid:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    ok, refund = await DataEngine.cancel_user_task_atomic(body.task_id, uid)
+    if not ok:
+        raise HTTPException(status_code=400, detail="nothing_to_cancel")
+    return {"ok": True, "refunded": refund}
 
 
 # ── /api/withdraw ─────────────────────────────────────────────────────────
@@ -2723,56 +3730,6 @@ async def api_withdraw_history(body: ApiBase):
     return {"withdrawals": [dict(r) for r in rows]}
 
 
-# ── /api/ads/* — AdsGram rewarded ads ──────────────────────────────────────
-@api_app.post("/api/ads/status")
-async def api_ads_status(body: ApiBase):
-    user = await _authenticate(body)
-    enabled    = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
-    block_id   = await DataEngine.get_setting("adsgram_block_id", "")
-    reward     = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
-    daily_cap  = int(float(await DataEngine.get_setting("ad_daily_limit", "10")))
-    cooldown   = int(float(await DataEngine.get_setting("ad_cooldown_seconds", "20")))
-    watched    = await DataEngine.get_ad_views_today(user["user_id"])
-    since_last = await DataEngine.get_seconds_since_last_ad_view(user["user_id"])
-    seconds_left = max(0, int(cooldown - since_last)) if since_last is not None else 0
-    return {
-        "enabled": enabled and bool(block_id) and watched < daily_cap,
-        "block_id": block_id,
-        "reward_amount": reward,
-        "daily_limit": daily_cap,
-        "watched_today": watched,
-        "cooldown_seconds": cooldown,
-        "seconds_left": seconds_left,
-    }
-
-
-@api_app.post("/api/ads/claim")
-async def api_ads_claim(body: ApiBase):
-    """Credits one rewarded-ad view. Called by the frontend only after the
-    AdsGram SDK reports the ad was watched to completion — but the actual
-    payout, the daily cap, and the cooldown are all enforced here from our
-    own database, not from anything the client asserts, so a tampered
-    client can't mint free balance."""
-    user = await _authenticate(body)
-    if (await DataEngine.get_setting("ads_enabled", "0")) != "1":
-        raise HTTPException(status_code=400, detail="ads_disabled")
-
-    daily_cap = int(float(await DataEngine.get_setting("ad_daily_limit", "10")))
-    watched = await DataEngine.get_ad_views_today(user["user_id"])
-    if watched >= daily_cap:
-        raise HTTPException(status_code=400, detail="daily_limit_reached")
-
-    cooldown = int(float(await DataEngine.get_setting("ad_cooldown_seconds", "20")))
-    since_last = await DataEngine.get_seconds_since_last_ad_view(user["user_id"])
-    if since_last is not None and since_last < cooldown:
-        raise HTTPException(status_code=400, detail="cooldown_active")
-
-    reward = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
-    await DataEngine.credit_ad_view(user["user_id"], reward)
-    fresh = await DataEngine.get_user(user["user_id"])
-    return {"ok": True, "credited": reward, "balance": float(fresh["balance"]), "watched_today": watched + 1}
-
-
 # ── /api/admin/stats/overview — total & online users ─────────────────────
 @api_app.post("/api/admin/stats/overview")
 async def api_admin_stats_overview(body: ApiBase):
@@ -2782,7 +3739,57 @@ async def api_admin_stats_overview(body: ApiBase):
     return {"total_users": total, "online_users": online}
 
 
-# ── /api/admin/tasks/* ────────────────────────────────────────────────────
+# ── /api/admin/ads/analytics — clicks vs completions + daily-limit list ──
+@api_app.post("/api/admin/ads/analytics")
+async def api_admin_ads_analytics(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    video_daily_limit = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    dl_daily_limit     = int(await DataEngine.get_setting("direct_link_daily_limit", "10"))
+    return await DataEngine.get_ads_admin_analytics(video_daily_limit, dl_daily_limit)
+
+
+# ── /api/admin/tasks/review — approve/reject user-submitted (escrowed)
+#    tasks before they go live to other users ───────────────────────────
+@api_app.post("/api/admin/tasks/pending")
+async def api_admin_tasks_pending(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    rows = await DataEngine.get_pending_review_tasks()
+    return {"tasks": [dict(r) for r in rows]}
+
+
+class AdminTaskReviewRequest(ApiBase):
+    id: int
+    approve: bool
+
+
+@api_app.post("/api/admin/tasks/review")
+async def api_admin_tasks_review(body: AdminTaskReviewRequest):
+    user = await _authenticate(body)
+    _require_admin(user)
+    task = await DataEngine.get_task(body.id)
+    if not task or task["review_status"] != "pending":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if body.approve:
+        await DataEngine.update_task(body.id, review_status="approved", is_active=1)
+        note = "✅ Your task has been approved and is now live!"
+    else:
+        # Full refund — none of the escrowed slots were ever usable.
+        refund = round(float(task["budget_slots"]) * float(task["reward"]), 2)
+        if refund > 0 and task["created_by"]:
+            await DataEngine.add_balance(task["created_by"], refund)
+        await DataEngine.update_task(body.id, review_status="rejected", is_active=0)
+        note = f"❌ Your submitted task was rejected. {refund:.2f} Birr has been refunded to your balance."
+    if task["created_by"]:
+        try:
+            await bot.send_message(task["created_by"], note)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+# ── /api/admin/tasks/list ────────────────────────────────────────────────
 @api_app.post("/api/admin/tasks/list")
 async def api_admin_tasks_list(body: ApiBase):
     user = await _authenticate(body)
@@ -2925,11 +3932,17 @@ async def api_admin_withdrawals_list(body: ApiBase):
     return {"withdrawals": [dict(r) for r in rows]}
 
 
+class AdminWithdrawalApproveRequest(ApiBase):
+    id: int
+    notify_mode: str = "both"  # "both" | "channel_only"
+
+
 @api_app.post("/api/admin/withdrawals/approve")
-async def api_admin_withdrawals_approve(body: AdminIdRequest):
+async def api_admin_withdrawals_approve(body: AdminWithdrawalApproveRequest):
     user = await _authenticate(body)
     _require_admin(user)
-    result = await approve_withdrawal_core(body.id)
+    mode = body.notify_mode if body.notify_mode in ("both", "channel_only") else "both"
+    result = await approve_withdrawal_core(body.id, notify_mode=mode)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["reason"])
     return {"ok": True}
@@ -3010,11 +4023,35 @@ async def api_admin_settings(body: ApiBase):
     return {
         "reward_per_referral": float(rate),
         "min_withdrawal": float(min_w),
+        # AdsGram — rewarded video
         "ads_enabled": (await DataEngine.get_setting("ads_enabled", "0")) == "1",
-        "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", ""),
+        "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", "") or "",
         "ad_reward_amount": float(await DataEngine.get_setting("ad_reward_amount", "0.5")),
-        "ad_daily_limit": int(float(await DataEngine.get_setting("ad_daily_limit", "10"))),
-        "ad_cooldown_seconds": int(float(await DataEngine.get_setting("ad_cooldown_seconds", "20"))),
+        "ad_daily_limit": int(await DataEngine.get_setting("ad_daily_limit", "10")),
+        "ad_cooldown_seconds": int(await DataEngine.get_setting("ad_cooldown_seconds", "30")),
+        # AdsGram — Direct Link
+        "adsgram_direct_link": await DataEngine.get_setting("adsgram_direct_link", "") or "",
+        "direct_link_reward_amount": float(await DataEngine.get_setting("direct_link_reward_amount", "0.3")),
+        "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
+        "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
+        "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+        # Monetag — fallback rewarded network when AdsGram has no fill
+        "monetag_zone_id": await DataEngine.get_setting("monetag_zone_id", "") or "",
+        "monetag_sdk_url": await DataEngine.get_setting("monetag_sdk_url", "") or "",
+        # Referral skip — silently withhold payment for some referrals
+        "referral_skip_enabled": (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1",
+        "referral_skip_batch_size": int(await DataEngine.get_setting("referral_skip_batch_size", "6")),
+        "referral_skip_min": int(await DataEngine.get_setting("referral_skip_min", "1")),
+        "referral_skip_max": int(await DataEngine.get_setting("referral_skip_max", "3")),
+        # User self-serve task creation (users advertise their own channel,
+        # paid from their own balance)
+        "user_task_creation_enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
+        "user_task_min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
+        "user_task_max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
+        "user_task_min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
+        "user_task_max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
+        # Support contact — shown as a floating support button in the dashboard
+        "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
 
 
@@ -3025,7 +4062,24 @@ class AdminSettingsUpdateRequest(ApiBase):
     adsgram_block_id: str = ""
     ad_reward_amount: float = 0.5
     ad_daily_limit: int = 10
-    ad_cooldown_seconds: int = 20
+    ad_cooldown_seconds: int = 30
+    adsgram_direct_link: str = ""
+    direct_link_reward_amount: float = 0.3
+    direct_link_daily_limit: int = 10
+    direct_link_wait_seconds: int = 15
+    direct_link_cooldown_seconds: int = 30
+    monetag_zone_id: str = ""
+    monetag_sdk_url: str = ""
+    referral_skip_enabled: bool = False
+    referral_skip_batch_size: int = 6
+    referral_skip_min: int = 1
+    referral_skip_max: int = 3
+    user_task_creation_enabled: bool = False
+    user_task_min_reward: float = 1
+    user_task_max_reward: float = 20
+    user_task_min_slots: int = 5
+    user_task_max_slots: int = 500
+    support_username: str = ""
 
 
 @api_app.post("/api/admin/settings/update")
@@ -3039,7 +4093,50 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("ad_reward_amount", str(body.ad_reward_amount))
     await DataEngine.set_setting("ad_daily_limit", str(body.ad_daily_limit))
     await DataEngine.set_setting("ad_cooldown_seconds", str(body.ad_cooldown_seconds))
+    await DataEngine.set_setting("adsgram_direct_link", body.adsgram_direct_link.strip())
+    await DataEngine.set_setting("direct_link_reward_amount", str(body.direct_link_reward_amount))
+    await DataEngine.set_setting("direct_link_daily_limit", str(body.direct_link_daily_limit))
+    await DataEngine.set_setting("direct_link_wait_seconds", str(body.direct_link_wait_seconds))
+    await DataEngine.set_setting("direct_link_cooldown_seconds", str(body.direct_link_cooldown_seconds))
+    await DataEngine.set_setting("monetag_zone_id", body.monetag_zone_id.strip())
+    await DataEngine.set_setting("monetag_sdk_url", body.monetag_sdk_url.strip())
+    await DataEngine.set_setting("referral_skip_enabled", "1" if body.referral_skip_enabled else "0")
+    await DataEngine.set_setting("referral_skip_batch_size", str(max(2, body.referral_skip_batch_size)))
+    await DataEngine.set_setting("referral_skip_min", str(max(0, body.referral_skip_min)))
+    await DataEngine.set_setting("referral_skip_max", str(max(body.referral_skip_min, body.referral_skip_max)))
+    await DataEngine.set_setting("user_task_creation_enabled", "1" if body.user_task_creation_enabled else "0")
+    await DataEngine.set_setting("user_task_min_reward", str(body.user_task_min_reward))
+    await DataEngine.set_setting("user_task_max_reward", str(body.user_task_max_reward))
+    await DataEngine.set_setting("user_task_min_slots", str(body.user_task_min_slots))
+    await DataEngine.set_setting("user_task_max_slots", str(body.user_task_max_slots))
+    await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     return {"ok": True}
+
+
+# ── /api/admin/ads/verify — connection check shown in the dashboard ─────
+@api_app.post("/api/admin/ads/verify")
+async def api_admin_ads_verify(body: ApiBase):
+    user = await _authenticate(body)
+    _require_admin(user)
+    block_id     = (await DataEngine.get_setting("adsgram_block_id", "") or "").strip()
+    direct_link  = (await DataEngine.get_setting("adsgram_direct_link", "") or "").strip()
+    monetag_zone = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
+    monetag_url  = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
+    ads_enabled  = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+    video_ready  = ads_enabled and bool(block_id)
+    link_ready   = ads_enabled and direct_link.lower().startswith(("http://", "https://"))
+    monetag_ready = ads_enabled and bool(monetag_zone) and monetag_url.lower().startswith(("http://", "https://"))
+    return {
+        "sdk_script_present": True,  # sad.min.js is loaded in frontend/app.html <head>
+        "ads_enabled": ads_enabled,
+        "block_id_configured": bool(block_id),
+        "direct_link_configured": bool(direct_link),
+        "direct_link_valid_url": link_ready,
+        "video_ready": video_ready,
+        "direct_link_ready": link_ready,
+        "monetag_configured": bool(monetag_zone) and bool(monetag_url),
+        "monetag_ready": monetag_ready,
+    }
 
 
 # ── /api/admin/broadcast — free-text announcement to all users ──────────
@@ -3058,6 +4155,39 @@ async def api_admin_broadcast(body: AdminBroadcastRequest):
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# DATABASE BACKUPS — periodically ships a copy of the SQLite file to a
+# private Telegram channel (only you should be a member of it). This is
+# a safety net in case the Railway Volume itself is ever lost/corrupted;
+# it does NOT replace the Volume, it's a second, independent copy.
+# ═════════════════════════════════════════════════════════════════════════
+async def send_db_backup():
+    if not DB_BACKUP_CHANNEL_ID:
+        return
+    if not os.path.exists(DB_PATH):
+        logger.warning(f"DB backup skipped — {DB_PATH} does not exist yet")
+        return
+    try:
+        stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-UTC")
+        await bot.send_document(
+            chat_id=DB_BACKUP_CHANNEL_ID,
+            document=FSInputFile(DB_PATH, filename=f"referral_bot_{stamp}.db"),
+            caption=f"🗄 Automatic DB backup — {stamp}",
+        )
+        logger.info(f"DB backup sent to {DB_BACKUP_CHANNEL_ID}")
+    except Exception as e:
+        logger.warning(f"DB backup failed: {e}")
+
+
+async def db_backup_loop():
+    # Send one right away at startup so there's always a fresh copy, then
+    # repeat on the configured interval for as long as the process runs.
+    await send_db_backup()
+    while True:
+        await asyncio.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
+        await send_db_backup()
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT — runs the Telegram long-poller AND the Mini App web server
 # in the same process (this is what Railway's "web: python bot.py" and
 # healthcheckPath "/health" in railway.toml expect).
@@ -3070,14 +4200,24 @@ async def _run_web_server():
 
 
 async def _main():
-    global _polling_task, BOT_USERNAME
+    global _polling_task, BOT_USERNAME, BOT_ID
     await DataEngine.init_database()
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
+        BOT_ID = me.id
     except Exception as e:
         logger.warning(f"Could not fetch bot identity at startup: {e}")
+    # Pre-warm the invite-card photo cache so the very first time someone
+    # taps "Share with Friends", Telegram's inline query gets answered
+    # instantly instead of waiting on a first-time get_user_profile_photos
+    # round-trip (which is what made it feel like a slow "search").
+    try:
+        await _get_bot_photo_file_id()
+    except Exception as e:
+        logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    asyncio.create_task(db_backup_loop())
     await _run_web_server()
 
 
