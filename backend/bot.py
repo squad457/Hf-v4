@@ -2118,7 +2118,7 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
     user = await DataEngine.get_user(uid)
     me   = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}")
     ]])
 
     post_id = 0
@@ -2273,7 +2273,7 @@ async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}")
     ]])
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         txt = (
