@@ -1861,6 +1861,8 @@ async function adminSettings(body){
       <input id="stReward" type="number" value="${s.reward_per_referral}">
       <label class="f">Minimum Withdrawal (Birr)</label>
       <input id="stMinWd" type="number" value="${s.min_withdrawal}">
+      <label class="f">Minimum Ads Required for Withdrawal (0 to disable)</label>
+      <input id="stMinAdsWd" type="number" value="${s.min_ads_for_withdrawal}">
       <label class="f">👨‍🔧 Support Telegram Username</label>
       <input id="stSupportUser" type="text" placeholder="e.g. hf_support (no @)" value="${escapeHtml(s.support_username || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
@@ -1962,6 +1964,7 @@ async function adminSettings(body){
 async function saveSettings(){
   const reward_per_referral = parseFloat(document.getElementById("stReward").value);
   const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
+  const min_ads_for_withdrawal = parseInt(document.getElementById("stMinAdsWd").value, 10);
   const support_username = document.getElementById("stSupportUser").value.trim().replace(/^@/, "");
   const ads_enabled = document.getElementById("stAdsEnabled").value === "1";
   const adsgram_block_id = document.getElementById("stAdBlock").value.trim();
@@ -1985,7 +1988,7 @@ async function saveSettings(){
   const user_task_min_slots = parseInt(document.getElementById("stUtcMinSlots").value, 10);
   const user_task_max_slots = parseInt(document.getElementById("stUtcMaxSlots").value, 10);
   await api("/api/admin/settings/update", {
-    reward_per_referral, min_withdrawal, support_username,
+    reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
     ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
     adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
     direct_link_wait_seconds, direct_link_cooldown_seconds,
