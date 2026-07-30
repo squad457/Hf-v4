@@ -882,6 +882,16 @@ class DataEngine:
             return row[0] if row else 0
 
     @staticmethod
+    async def count_total_completed_ads(user_id: int) -> int:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND status='completed'",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    @staticmethod
     async def get_last_ad_event(user_id: int, kind: str):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -2198,6 +2208,15 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
     the Mini App REST endpoint (/api/withdraw), so there's exactly one
     place that creates the ledger row and notifies admins.
     """
+    min_ads_req = int(await DataEngine.get_setting("min_ads_for_withdrawal", "30"))
+    if min_ads_req > 0:
+        total_ads = await DataEngine.count_total_completed_ads(uid)
+        if total_ads < min_ads_req:
+            return {
+                "status": "error",
+                "reason": f"⚠️ To complete your withdrawal request, you must watch at least {min_ads_req} ads first. You have currently watched {total_ads}/{min_ads_req} ads. Please watch more ads and try again!"
+            }
+
     tid, ok = await DataEngine.create_withdrawal_atomic(uid, amount, full_name, phone)
     if not ok:
         return {"status": "error", "reason": "insufficient_funds"}
@@ -2274,7 +2293,19 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
         uid, s["validated_volume"], s["validated_title"], s["validated_phone"]
     )
     if result["status"] == "error":
-        return await callback.answer("❌ Insufficient funds.", show_alert=True)
+        reason = result.get("reason", "❌ Insufficient funds.")
+        if "30 ads" in reason:
+            await state.clear()
+            return await callback.message.edit_text(
+                f"{reason}\n\n👇 <b>Tap below to open the Mini App and watch your required ads:</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎬 Watch Ads in Mini App", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))],
+                    [InlineKeyboardButton(text="🔙 Back / ተመለስ", callback_data="ui_return_home")]
+                ])
+            )
+        if reason == "insufficient_funds":
+            reason = "❌ Insufficient funds."
+        return await callback.answer(reason, show_alert=True)
 
     await state.clear()
     await callback.message.edit_text(
@@ -4219,9 +4250,11 @@ async def api_admin_settings(body: ApiBase):
     _require_admin(user)
     rate = await DataEngine.get_setting("reward_per_referral", "10")
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
+    min_ads = await DataEngine.get_setting("min_ads_for_withdrawal", "30")
     return {
         "reward_per_referral": float(rate),
         "min_withdrawal": float(min_w),
+        "min_ads_for_withdrawal": int(min_ads),
         # AdsGram — rewarded video
         "ads_enabled": (await DataEngine.get_setting("ads_enabled", "0")) == "1",
         "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", "") or "",
@@ -4257,6 +4290,7 @@ async def api_admin_settings(body: ApiBase):
 class AdminSettingsUpdateRequest(ApiBase):
     reward_per_referral: float
     min_withdrawal: float
+    min_ads_for_withdrawal: int = 30
     ads_enabled: bool = False
     adsgram_block_id: str = ""
     ad_reward_amount: float = 0.5
@@ -4289,6 +4323,7 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     _require_admin(user)
     await DataEngine.set_setting("reward_per_referral", str(body.reward_per_referral))
     await DataEngine.set_setting("min_withdrawal", str(body.min_withdrawal))
+    await DataEngine.set_setting("min_ads_for_withdrawal", str(body.min_ads_for_withdrawal))
     await DataEngine.set_setting("ads_enabled", "1" if body.ads_enabled else "0")
     await DataEngine.set_setting("adsgram_block_id", body.adsgram_block_id.strip())
     await DataEngine.set_setting("ad_reward_amount", str(body.ad_reward_amount))
