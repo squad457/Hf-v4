@@ -323,6 +323,7 @@ CREATE INDEX IF NOT EXISTS idx_users_last_seen      ON users(last_seen);
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('min_ads_for_withdrawal', '30');
 
 -- AdsGram — rewarded video
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', '0');
@@ -1329,9 +1330,9 @@ class DataEngine:
 #   • Self-referral (referrer_id == new_user_id)        → BAN (ሁልጊዜ ግልጽ ነው)
 #   • Score ≥ 3/4 ምድቦች ከአንድ ተመሳሳይ user ጋር ይገጣጠማሉ        → BAN
 #   • Score 1-2                                          → LOG ብቻ (admin review)
-#   • referrer ጋር ብቻ: fingerprint + (IP ወይም hardware)
-#     ሁለቱም ይገጣጠማሉ                                       → BAN ("ራሱ ራሱን ጋበዘ")
-#   • referrer ጋር fingerprint ብቻ ወይም IP ብቻ ይገጣጠማል         → LOG ብቻ
+#   • referrer ጋር ብቻ: ከ fingerprint, IP, hardware ውስጥ ማንኛውም 2ቱ
+#     ይገጣጠማሉ                                             → BAN ("ራሱ ራሱን ጋበዘ")
+#   • referrer ጋር ከ 3ቱ ውስጥ 1 ብቻ ይገጣጠማል                    → LOG ብቻ
 #   • IP farm: ብዙ users በአንድ IP ላይ *እና* ጥቂት የተለያዩ
 #     fingerprints (ስለዚህ duplicate ስክሪፕት farm ይመስላል)      → BAN
 #     ብዙ users በአንድ IP ላይ ግን እያንዳንዱ የተለየ fingerprint
@@ -1482,9 +1483,20 @@ async def evaluate_clone_risk(
 
                 ref_score = sum([fp_matches_ref, ip_matches_ref, hw_matches_ref])
 
-                if fp_matches_ref and (ip_matches_ref or hw_matches_ref):
+                # Any 2-out-of-3 signals matching the referrer (fingerprint,
+                # IP, or hardware) is treated as the same person referring
+                # themselves via a second account — auto-ban. A single
+                # matching signal alone (e.g. just shared IP/WiFi, or just
+                # shared fingerprint) stays log-only, since that alone is
+                # normal for real friends/family.
+                if ref_score >= 2:
+                    logger.warning(
+                        f"[FRAUD] Multi-signal match with referrer — banning: "
+                        f"ref={referrer_id} new={new_user_id} "
+                        f"fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score}"
+                    )
                     return True, "same_device_as_referrer"
-                elif ref_score >= 1:
+                elif ref_score == 1:
                     logger.warning(
                         f"[FRAUD-WARN] Single-signal match with referrer (not banning): "
                         f"ref={referrer_id} new={new_user_id} "
@@ -2208,7 +2220,7 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
     the Mini App REST endpoint (/api/withdraw), so there's exactly one
     place that creates the ledger row and notifies admins.
     """
-    min_ads_req = int(await DataEngine.get_setting("min_ads_for_withdrawal", "30"))
+    min_ads_req = _safe_int(await DataEngine.get_setting("min_ads_for_withdrawal", "30"), 30)
     if min_ads_req > 0:
         total_ads = await DataEngine.count_total_completed_ads(uid)
         if total_ads < min_ads_req:
@@ -4243,6 +4255,20 @@ async def api_admin_users_balance(body: AdminUserBalanceRequest):
     return {"ok": True}
 
 
+def _safe_int(val, default: int) -> int:
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val, default: float) -> float:
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # ── /api/admin/settings ───────────────────────────────────────────────────
 @api_app.post("/api/admin/settings")
 async def api_admin_settings(body: ApiBase):
@@ -4252,36 +4278,36 @@ async def api_admin_settings(body: ApiBase):
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
     min_ads = await DataEngine.get_setting("min_ads_for_withdrawal", "30")
     return {
-        "reward_per_referral": float(rate),
-        "min_withdrawal": float(min_w),
-        "min_ads_for_withdrawal": int(min_ads),
+        "reward_per_referral": _safe_float(rate, 10.0),
+        "min_withdrawal": _safe_float(min_w, 50.0),
+        "min_ads_for_withdrawal": _safe_int(min_ads, 30),
         # AdsGram — rewarded video
         "ads_enabled": (await DataEngine.get_setting("ads_enabled", "0")) == "1",
         "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", "") or "",
-        "ad_reward_amount": float(await DataEngine.get_setting("ad_reward_amount", "0.5")),
-        "ad_daily_limit": int(await DataEngine.get_setting("ad_daily_limit", "10")),
-        "ad_cooldown_seconds": int(await DataEngine.get_setting("ad_cooldown_seconds", "30")),
+        "ad_reward_amount": _safe_float(await DataEngine.get_setting("ad_reward_amount", "0.5"), 0.5),
+        "ad_daily_limit": _safe_int(await DataEngine.get_setting("ad_daily_limit", "10"), 10),
+        "ad_cooldown_seconds": _safe_int(await DataEngine.get_setting("ad_cooldown_seconds", "30"), 30),
         # AdsGram — Direct Link
         "adsgram_direct_link": await DataEngine.get_setting("adsgram_direct_link", "") or "",
-        "direct_link_reward_amount": float(await DataEngine.get_setting("direct_link_reward_amount", "0.3")),
-        "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
-        "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
-        "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+        "direct_link_reward_amount": _safe_float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"), 0.3),
+        "direct_link_daily_limit": _safe_int(await DataEngine.get_setting("direct_link_daily_limit", "10"), 10),
+        "direct_link_wait_seconds": _safe_int(await DataEngine.get_setting("direct_link_wait_seconds", "15"), 15),
+        "direct_link_cooldown_seconds": _safe_int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"), 30),
         # Monetag — fallback rewarded network when AdsGram has no fill
         "monetag_zone_id": await DataEngine.get_setting("monetag_zone_id", "") or "",
         "monetag_sdk_url": await DataEngine.get_setting("monetag_sdk_url", "") or "",
         # Referral skip — silently withhold payment for some referrals
         "referral_skip_enabled": (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1",
-        "referral_skip_batch_size": int(await DataEngine.get_setting("referral_skip_batch_size", "6")),
-        "referral_skip_min": int(await DataEngine.get_setting("referral_skip_min", "1")),
-        "referral_skip_max": int(await DataEngine.get_setting("referral_skip_max", "3")),
+        "referral_skip_batch_size": _safe_int(await DataEngine.get_setting("referral_skip_batch_size", "6"), 6),
+        "referral_skip_min": _safe_int(await DataEngine.get_setting("referral_skip_min", "1"), 1),
+        "referral_skip_max": _safe_int(await DataEngine.get_setting("referral_skip_max", "3"), 3),
         # User self-serve task creation (users advertise their own channel,
         # paid from their own balance)
         "user_task_creation_enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
-        "user_task_min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
-        "user_task_max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
-        "user_task_min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
-        "user_task_max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
+        "user_task_min_reward": _safe_float(await DataEngine.get_setting("user_task_min_reward", "1"), 1.0),
+        "user_task_max_reward": _safe_float(await DataEngine.get_setting("user_task_max_reward", "20"), 20.0),
+        "user_task_min_slots": _safe_int(await DataEngine.get_setting("user_task_min_slots", "5"), 5),
+        "user_task_max_slots": _safe_int(await DataEngine.get_setting("user_task_max_slots", "500"), 500),
         # Support contact — shown as a floating support button in the dashboard
         "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
     }
