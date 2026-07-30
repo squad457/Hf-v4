@@ -1854,15 +1854,21 @@ async function adminAds(body){
 
 /* ── Admin: Settings ──────────────────────────────────────────── */
 async function adminSettings(body){
-  const s = await api("/api/admin/settings");
+  let s;
+  try {
+    s = await api("/api/admin/settings");
+  } catch (e) {
+    body.innerHTML = `<div class="empty">Couldn't load settings. ${escapeHtml(e?.message || "")}</div>`;
+    return;
+  }
   body.innerHTML = `
     <div class="card">
       <label class="f">Reward per Referral (Birr)</label>
-      <input id="stReward" type="number" value="${s.reward_per_referral}">
+      <input id="stReward" type="number" value="${s.reward_per_referral ?? 10}">
       <label class="f">Minimum Withdrawal (Birr)</label>
-      <input id="stMinWd" type="number" value="${s.min_withdrawal}">
+      <input id="stMinWd" type="number" value="${s.min_withdrawal ?? 50}">
       <label class="f">Minimum Ads Required for Withdrawal (0 to disable)</label>
-      <input id="stMinAdsWd" type="number" value="${s.min_ads_for_withdrawal}">
+      <input id="stMinAdsWd" type="number" value="${s.min_ads_for_withdrawal ?? 30}">
       <label class="f">👨‍🔧 Support Telegram Username</label>
       <input id="stSupportUser" type="text" placeholder="e.g. hf_support (no @)" value="${escapeHtml(s.support_username || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
@@ -1961,44 +1967,53 @@ async function adminSettings(body){
     </div>
   `;
 }
+function _num(id, fallback, isInt){
+  const raw = document.getElementById(id).value;
+  const v = isInt ? parseInt(raw, 10) : parseFloat(raw);
+  return Number.isFinite(v) ? v : fallback;
+}
 async function saveSettings(){
-  const reward_per_referral = parseFloat(document.getElementById("stReward").value);
-  const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
-  const min_ads_for_withdrawal = parseInt(document.getElementById("stMinAdsWd").value, 10);
+  const reward_per_referral = _num("stReward", 10, false);
+  const min_withdrawal = _num("stMinWd", 50, false);
+  const min_ads_for_withdrawal = _num("stMinAdsWd", 30, true);
   const support_username = document.getElementById("stSupportUser").value.trim().replace(/^@/, "");
   const ads_enabled = document.getElementById("stAdsEnabled").value === "1";
   const adsgram_block_id = document.getElementById("stAdBlock").value.trim();
-  const ad_reward_amount = parseFloat(document.getElementById("stAdReward").value);
-  const ad_daily_limit = parseInt(document.getElementById("stAdDaily").value, 10);
-  const ad_cooldown_seconds = parseInt(document.getElementById("stAdCooldown").value, 10);
+  const ad_reward_amount = _num("stAdReward", 0.5, false);
+  const ad_daily_limit = _num("stAdDaily", 10, true);
+  const ad_cooldown_seconds = _num("stAdCooldown", 30, true);
   const adsgram_direct_link = document.getElementById("stAdDirectLink").value.trim();
-  const direct_link_reward_amount = parseFloat(document.getElementById("stAdDlReward").value);
-  const direct_link_daily_limit = parseInt(document.getElementById("stAdDlDaily").value, 10);
-  const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
-  const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
+  const direct_link_reward_amount = _num("stAdDlReward", 0.3, false);
+  const direct_link_daily_limit = _num("stAdDlDaily", 10, true);
+  const direct_link_wait_seconds = _num("stAdDlWait", 15, true);
+  const direct_link_cooldown_seconds = _num("stAdDlCooldown", 30, true);
   const monetag_sdk_url = document.getElementById("stMonetagUrl").value.trim();
   const monetag_zone_id = document.getElementById("stMonetagZone").value.trim();
   const referral_skip_enabled = document.getElementById("stRefSkipEnabled").value === "1";
-  const referral_skip_batch_size = parseInt(document.getElementById("stRefSkipBatch").value, 10);
-  const referral_skip_min = parseInt(document.getElementById("stRefSkipMin").value, 10);
-  const referral_skip_max = parseInt(document.getElementById("stRefSkipMax").value, 10);
+  const referral_skip_batch_size = _num("stRefSkipBatch", 6, true);
+  const referral_skip_min = _num("stRefSkipMin", 1, true);
+  const referral_skip_max = _num("stRefSkipMax", 3, true);
   const user_task_creation_enabled = document.getElementById("stUtcEnabled").value === "1";
-  const user_task_min_reward = parseFloat(document.getElementById("stUtcMinReward").value);
-  const user_task_max_reward = parseFloat(document.getElementById("stUtcMaxReward").value);
-  const user_task_min_slots = parseInt(document.getElementById("stUtcMinSlots").value, 10);
-  const user_task_max_slots = parseInt(document.getElementById("stUtcMaxSlots").value, 10);
-  await api("/api/admin/settings/update", {
-    reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
-    ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
-    adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
-    direct_link_wait_seconds, direct_link_cooldown_seconds,
-    monetag_sdk_url, monetag_zone_id,
-    referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
-    user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
-    user_task_min_slots, user_task_max_slots,
-  });
-  toast("✅ Settings saved");
-  refreshMe();
+  const user_task_min_reward = _num("stUtcMinReward", 1, false);
+  const user_task_max_reward = _num("stUtcMaxReward", 20, false);
+  const user_task_min_slots = _num("stUtcMinSlots", 5, true);
+  const user_task_max_slots = _num("stUtcMaxSlots", 500, true);
+  try {
+    await api("/api/admin/settings/update", {
+      reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
+      ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
+      adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
+      direct_link_wait_seconds, direct_link_cooldown_seconds,
+      monetag_sdk_url, monetag_zone_id,
+      referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
+      user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
+      user_task_min_slots, user_task_max_slots,
+    });
+    toast("✅ Settings saved");
+    refreshMe();
+  } catch (e) {
+    toast(`❌ Save failed: ${e?.message || "unknown error"}`);
+  }
 }
 async function checkAdsgramConnection(){
   const box = document.getElementById("adsgramCheckResult");
