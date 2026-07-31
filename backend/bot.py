@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import logging
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import time
 
@@ -302,6 +302,16 @@ CREATE TABLE IF NOT EXISTS ad_events (
 );
 CREATE INDEX IF NOT EXISTS idx_ad_events_user_kind ON ad_events(user_id, kind, completed_at);
 
+-- Tracks the daily "ads reset" notifications so each user gets at most
+-- one of each message per calendar day, even though the sender loop
+-- wakes up and re-checks multiple times a day.
+CREATE TABLE IF NOT EXISTS daily_notify_log (
+    user_id     INTEGER,
+    notify_type TEXT,
+    notify_date TEXT,
+    PRIMARY KEY (user_id, notify_type, notify_date)
+);
+
 -- ─────────────────────────────────────────────────────────────────────────
 -- PERFORMANCE INDEXES
 -- ብዙ users ሲኖሩ balance/referrals/withdraw ቁልፎች የሚጠቀሙባቸውን query ዎች
@@ -342,6 +352,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_slots', '500'
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_reward_amount', '0.5');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_daily_limit', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '30');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_reset_broadcast_enabled', '1');
 
 -- AdsGram — Direct Link
 INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_direct_link', '');
@@ -988,6 +999,19 @@ class DataEngine:
             except Exception:
                 await db.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    async def mark_notified_today(user_id: int, notify_type: str) -> bool:
+        """Records that user_id received notify_type today. Returns True the
+        first time (caller should send), False if already sent today."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO daily_notify_log (user_id, notify_type, notify_date) "
+                "VALUES (?, ?, date('now'))",
+                (user_id, notify_type),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     @staticmethod
     async def log_ad_click(user_id: int, kind: str):
@@ -2015,40 +2039,174 @@ async def notify_user_limit_reached(user_id: int):
     except Exception as e:
         logger.warning(f"Failed to send limit notification to {user_id}: {e}")
 
+async def send_ads_limit_reset_reminder(user_id: int) -> bool:
+    """For users who HIT their daily ad-watch limit yesterday — tells them
+    the limit has reset and invites them back to watch more.
+    Returns True if delivered, False if the send failed (e.g. user
+    blocked the bot)."""
+    try:
+        text = (
+            "🎉 <b>Daily Limit Reset!</b>\n\n"
+            "You watched ads yesterday! Your limit has reset for today 🚀\n"
+            "Come back and watch more ads to earn money!"
+        )
+        await bot.send_message(
+            user_id, text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎬 Watch Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
+            ]])
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send ads-reset reminder to {user_id}: {e}")
+        return False
+
+
+async def send_ads_start_earning_reminder(user_id: int) -> bool:
+    """For users who watched ZERO ads yesterday — a different message
+    inviting them to start watching ads to earn, rather than implying
+    they're returning to something they already do.
+    Returns True if delivered, False if the send failed."""
+    try:
+        text = (
+            "💰 <b>A Chance to Earn Money is Waiting!</b>\n\n"
+            "You can easily earn money by watching ads.\n"
+            "Open now and start earning! 🎬"
+        )
+        await bot.send_message(
+            user_id, text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎬 Watch Ads", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
+            ]])
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send ads-start-earning reminder to {user_id}: {e}")
+        return False
+
+
+# Ethiopian "morning" window this broadcast fires within — roughly
+# ጥዋት 1 ሰዓት to ጥዋት 3 ሰዓት (07:00–09:00 EAT). Ethiopian clocks start
+# counting from dawn (~06:00 EAT = 0/12 o'clock). EAT is UTC+3 year-round
+# (no DST), so that's a fixed 04:00–06:00 UTC window.
+ADS_RESET_WINDOW_START_UTC_MINUTE = 4 * 60   # 04:00 UTC = 07:00 EAT
+ADS_RESET_WINDOW_END_UTC_MINUTE   = 6 * 60   # 06:00 UTC = 09:00 EAT
+
+
 async def notify_ad_limit_reset_loop():
+    """Runs once a day at a RANDOM time inside the Ethiopian-morning window
+    (07:00–09:00 EAT) — a new random minute is picked each day so the send
+    time isn't identical every day. Can be turned off entirely from the
+    bot-chat admin panel (⚙️ Admin → 🔔 Ads Reset Broadcast) via the
+    'ads_reset_broadcast_enabled' setting.
+
+    Two separate audiences, each notified once per run:
+      • Hit yesterday's daily ad-watch limit  -> 'limit reset, come back'
+      • Watched zero ads yesterday (but seen recently, not banned)
+                                               -> 'start watching, earn money'
+    daily_notify_log still guards against a duplicate send on the same
+    day (e.g. if the process restarts shortly after a run).
+    """
     while True:
         try:
-            await asyncio.sleep(3600 * 6)
+            now = datetime.utcnow()
+            random_minute = random.randint(
+                ADS_RESET_WINDOW_START_UTC_MINUTE, ADS_RESET_WINDOW_END_UTC_MINUTE
+            )
+            target = now.replace(hour=0, minute=0, second=0, microsecond=0) \
+                + timedelta(minutes=random_minute)
+            if target <= now:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+
+            broadcast_enabled = (await DataEngine.get_setting("ads_reset_broadcast_enabled", "1")) == "1"
+            if not broadcast_enabled:
+                continue
+            ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+            if not ads_enabled:
+                continue
+            ad_daily_limit = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
+
+                # Group 1: hit the daily limit yesterday
                 cur = await db.execute(
-                    "SELECT DISTINCT user_id FROM ad_events WHERE date(completed_at) = date('now', '-1 day')"
+                    "SELECT user_id, COUNT(*) c FROM ad_events "
+                    "WHERE kind=? AND status='completed' AND date(completed_at)=date('now','-1 day') "
+                    "GROUP BY user_id HAVING c >= ?",
+                    (AD_KIND_VIDEO, ad_daily_limit),
                 )
-                users = await cur.fetchall()
-                for row in users:
-                    uid = row["user_id"]
-                    today_count = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
-                    if today_count == 0:
-                        try:
-                            text = (
-                                "🎉 **Daily Limit Reset!**\n\n"
-                                "Dear user, your 24-hour ad viewing limit has been reset. You can now watch new ads and earn rewards again! 🚀\n\n"
-                                "Open the Mini App now to start earning:"
-                            )
-                            await bot.send_message(
-                                uid,
-                                text,
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
-                            )
-                            await asyncio.sleep(0.3)
-                        except Exception:
-                            pass
+                limit_reached_users = [r["user_id"] for r in await cur.fetchall()]
+
+                # Group 2: zero ads watched yesterday, but active recently
+                # (last 30 days) and not banned — avoids blasting long-dead
+                # accounts that never engage with ads at all.
+                cur2 = await db.execute(
+                    "SELECT user_id FROM users WHERE is_banned=0 "
+                    "AND date(last_seen) >= date('now', '-30 day') "
+                    "AND user_id NOT IN ("
+                    "  SELECT DISTINCT user_id FROM ad_events WHERE kind=? AND status='completed' "
+                    "  AND date(completed_at)=date('now','-1 day')"
+                    ")",
+                    (AD_KIND_VIDEO,),
+                )
+                inactive_users = [r["user_id"] for r in await cur2.fetchall()]
+
+            sent_limit, failed_limit, skipped_limit = 0, 0, 0
+            for uid in limit_reached_users:
+                if await DataEngine.mark_notified_today(uid, "ads_reset_limit"):
+                    ok = await send_ads_limit_reset_reminder(uid)
+                    sent_limit += 1 if ok else 0
+                    failed_limit += 0 if ok else 1
+                    await asyncio.sleep(0.3)
+                else:
+                    skipped_limit += 1
+
+            sent_earn, failed_earn, skipped_earn = 0, 0, 0
+            for uid in inactive_users:
+                if await DataEngine.mark_notified_today(uid, "ads_start_earn"):
+                    ok = await send_ads_start_earning_reminder(uid)
+                    sent_earn += 1 if ok else 0
+                    failed_earn += 0 if ok else 1
+                    await asyncio.sleep(0.3)
+                else:
+                    skipped_earn += 1
+
+            await report_ads_reset_broadcast_to_admins(
+                sent_limit, failed_limit, skipped_limit,
+                sent_earn, failed_earn, skipped_earn,
+            )
+
         except Exception as e:
             logger.warning(f"notify_ad_limit_reset_loop error: {e}")
-        await asyncio.sleep(3600 * 6)
+
+
+async def report_ads_reset_broadcast_to_admins(
+    sent_limit: int, failed_limit: int, skipped_limit: int,
+    sent_earn: int, failed_earn: int, skipped_earn: int,
+):
+    """Sends a short delivery summary to every configured admin after each
+    daily ads-reset broadcast run, so admins know how many users actually
+    got each message without checking logs."""
+    total_sent = sent_limit + sent_earn
+    total_failed = failed_limit + failed_earn
+    text = (
+        "🔔 <b>Ads Reset Broadcast — Delivery Report</b>\n\n"
+        "🎉 <b>Limit Reset</b> (watched ads yesterday, hit limit):\n"
+        f"   ✅ Delivered: {sent_limit}\n"
+        f"   ❌ Failed: {failed_limit}\n\n"
+        "💰 <b>Start Earning</b> (watched 0 ads yesterday):\n"
+        f"   ✅ Delivered: {sent_earn}\n"
+        f"   ❌ Failed: {failed_earn}\n\n"
+        f"📊 <b>Total delivered:</b> {total_sent}\n"
+        f"📊 <b>Total failed:</b> {total_failed}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Failed to send ads-broadcast report to admin {admin_id}: {e}")
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     # index.html (verify screen) is served from the FRONTEND (Vercel), NOT
@@ -2107,6 +2265,7 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📥 Pending Withdrawals", callback_data="adm_cmd_pending_tickets"),
             InlineKeyboardButton(text="📢 Broadcast Message",   callback_data="adm_cmd_broadcast"),
         ],
+        [InlineKeyboardButton(text="🔔 Ads Reset Broadcast",    callback_data="adm_cmd_ads_reset_menu")],
         [InlineKeyboardButton(text="🔍 Search User",            callback_data="adm_cmd_search")],
         [InlineKeyboardButton(text="⚠️ Fraud Log",              callback_data="adm_cmd_fraud_log")],
         [
@@ -2660,6 +2819,49 @@ async def process_rm_channel_action(callback: CallbackQuery):
         await db.execute("DELETE FROM force_channels WHERE id = ?", (row_id,))
         await db.commit()
     await callback.message.edit_text("✅ Channel removed.", reply_markup=generate_admin_dashboard())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — ADS RESET BROADCAST TOGGLE (bot-chat panel)
+#
+# Lets the admin enable/disable the daily 'ads limit reset' / 'start
+# earning' notification broadcast (notify_ad_limit_reset_loop) without
+# touching ads_enabled itself — so ads can stay on for users while the
+# daily reminder broadcast is paused, or vice versa.
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.callback_query(F.data == "adm_cmd_ads_reset_menu")
+async def show_ads_reset_broadcast_menu(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    enabled = (await DataEngine.get_setting("ads_reset_broadcast_enabled", "1")) == "1"
+    status_line = "✅ Currently: <b>Enabled</b>" if enabled else "🚫 Currently: <b>Disabled</b>"
+    await callback.message.edit_text(
+        "🔔 <b>Ads Reset Broadcast</b>\n\n"
+        "Sends a daily message to users, once a day at a random time in "
+        "the Ethiopian morning window (07:00–09:00 EAT):\n"
+        "• Watched ads yesterday & hit the limit → 'limit reset, come back'\n"
+        "• Watched zero ads yesterday → 'start watching, earn money'\n\n"
+        f"{status_line}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Enable",  callback_data="adm_ads_reset_enable")],
+            [InlineKeyboardButton(text="🚫 Disable", callback_data="adm_ads_reset_disable")],
+            [InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")],
+        ])
+    )
+
+@core_router.callback_query(F.data == "adm_ads_reset_enable")
+async def enable_ads_reset_broadcast(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await DataEngine.set_setting("ads_reset_broadcast_enabled", "1")
+    await callback.answer("✅ Ads reset broadcast enabled")
+    await show_ads_reset_broadcast_menu(callback)
+
+@core_router.callback_query(F.data == "adm_ads_reset_disable")
+async def disable_ads_reset_broadcast(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await DataEngine.set_setting("ads_reset_broadcast_enabled", "0")
+    await callback.answer("🚫 Ads reset broadcast disabled")
+    await show_ads_reset_broadcast_menu(callback)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — STOP / RESUME BOT ENGINE
@@ -4485,6 +4687,7 @@ async def _main():
         logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     asyncio.create_task(db_backup_loop())
+    asyncio.create_task(notify_ad_limit_reset_loop())
     await _run_web_server()
 
 
