@@ -1408,17 +1408,21 @@ async def evaluate_clone_risk(
     canvas_hash: str = "",
     webgl_hash: str = "",
     screen_sig: str = "",
-) -> tuple[bool, str]:
+    username: str = "",
+) -> tuple[bool, str, str]:
     """
-    Returns (should_ban: bool, reason: str).
+    Returns (should_ban: bool, reason: str, detail: str).
     Bans only when multiple independent signals correlate to the SAME other
     account. Any single matching signal alone is logged for admin review,
-    never auto-banned.
+    never auto-banned. `detail` carries the matched_uid/categories/score info
+    (plus the flagged user's own @username, when known) so the admin fraud
+    log can show exactly who a ban correlated with.
     """
+    uname_tag = f"flagged_username=@{username}" if username else "flagged_username=none"
 
     # ── 1. Self-referral ──────────────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
-        return True, "self_invite"
+        return True, "self_invite", f"referrer_id={referrer_id} {uname_tag}"
 
     ip_ok = bool(client_ip) and client_ip not in ("127.0.0.1", "::1", "unknown")
     fp_ok = bool(fingerprint) and fingerprint not in ("undefined", "null", "")
@@ -1468,7 +1472,10 @@ async def evaluate_clone_risk(
                 f"[FRAUD] Correlated clone: new_uid={new_user_id} matches "
                 f"uid={best_uid} on {best_matched} (score={best_score})"
             )
-            return True, "correlated_clone"
+            return True, "correlated_clone", (
+                f"matches_uid={best_uid} categories={best_matched} "
+                f"score={best_score} {uname_tag}"
+            )
         elif best_score >= 1:
             logger.warning(
                 f"[FRAUD-WARN] Partial signal match (not banning): "
@@ -1476,7 +1483,7 @@ async def evaluate_clone_risk(
             )
             await DataEngine.log_fraud_attempt(
                 new_user_id, "partial_signal_match", client_ip,
-                f"matches_uid={best_uid} categories={best_matched} score={best_score}"
+                f"matches_uid={best_uid} categories={best_matched} score={best_score} {uname_tag}"
             )
 
     # ── 3. Referrer device check ────────────────────────────────────────
@@ -1519,7 +1526,10 @@ async def evaluate_clone_risk(
                         f"ref={referrer_id} new={new_user_id} "
                         f"fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score}"
                     )
-                    return True, "same_device_as_referrer"
+                    return True, "same_device_as_referrer", (
+                        f"referrer={referrer_id} fp={fp_matches_ref} "
+                        f"ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score} {uname_tag}"
+                    )
                 elif ref_score == 1:
                     logger.warning(
                         f"[FRAUD-WARN] Single-signal match with referrer (not banning): "
@@ -1528,7 +1538,7 @@ async def evaluate_clone_risk(
                     )
                     await DataEngine.log_fraud_attempt(
                         new_user_id, "referrer_signal_match", client_ip,
-                        f"referrer={referrer_id} fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref}"
+                        f"referrer={referrer_id} fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref} {uname_tag}"
                     )
 
     # ── 4. IP farm detection — aware of shared-NAT / CGNAT networks ───────
@@ -1550,12 +1560,12 @@ async def evaluate_clone_risk(
             )
             await DataEngine.log_fraud_attempt(
                 new_user_id, "high_ip_usage", client_ip,
-                f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f}"
+                f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f} {uname_tag}"
             )
             if ip_count >= MAX_USERS_PER_IP_BAN and fp_ratio < IP_FARM_MIN_FP_RATIO:
-                return True, "ip_farm"
+                return True, "ip_farm", f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f} {uname_tag}"
 
-    return False, ""
+    return False, "", ""
 
 
 def extract_real_ip(request: Request) -> str:
@@ -2529,12 +2539,69 @@ async def process_fraud_log(callback: CallbackQuery):
         return await callback.message.edit_text(
             "📭 No fraud attempts logged.", reply_markup=generate_fallback_navigation("ui_admin_core")
         )
+
+    # Collect every user_id we'll need a username for: the flagged user on
+    # each row, plus any "matches_uid=<id>" referenced inside details.
+    ids_needed = set()
+    matched_uid_by_row = {}
+    for r in rows:
+        ids_needed.add(r["user_id"])
+        details = r["details"] or ""
+        if "matches_uid=" in details:
+            token = details.split("matches_uid=", 1)[1].split(" ", 1)[0].strip()
+            if token.isdigit():
+                matched_uid = int(token)
+                matched_uid_by_row[r["id"]] = matched_uid
+                ids_needed.add(matched_uid)
+
+    usernames = {}
+    if ids_needed:
+        placeholders = ",".join("?" for _ in ids_needed)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"SELECT user_id, username FROM users WHERE user_id IN ({placeholders})",
+                tuple(ids_needed),
+            )
+            for u in await cur.fetchall():
+                usernames[u["user_id"]] = u["username"]
+
+    def _uname(user_id: int) -> str:
+        uname = usernames.get(user_id)
+        return f"@{uname}" if uname else "no username"
+
+    def _flagged_uname(details: str, user_id: int) -> str:
+        # Newer rows carry "flagged_username=@x" / "flagged_username=none"
+        # straight from Telegram's initData at the moment of the attempt —
+        # prefer that (it's known even if the user was blocked before ever
+        # getting a `users` row). Fall back to the DB lookup for older rows.
+        if "flagged_username=" in details:
+            token = details.split("flagged_username=", 1)[1].split(" ", 1)[0].strip()
+            if token and token != "none":
+                return token if token.startswith("@") else f"@{token}"
+            return "no username"
+        return _uname(user_id)
+
     lines = []
     for r in rows:
+        details = r["details"] or ""
+        flagged_display = _flagged_uname(details, r["user_id"])
+        # Drop the raw tag from the body since it's now shown in the header.
+        if "flagged_username=" in details:
+            before, _, after_tag = details.partition("flagged_username=")
+            rest = after_tag.split(" ", 1)
+            remainder = rest[1] if len(rest) > 1 else ""
+            details = (before.strip() + " " + remainder.strip()).strip()
+        matched_uid = matched_uid_by_row.get(r["id"])
+        if matched_uid:
+            details = details.replace(
+                f"matches_uid={matched_uid}",
+                f"matches_uid={matched_uid} ({_uname(matched_uid)})",
+            )
         lines.append(
             f"⚠️ <code>{r['reason']}</code>\n"
-            f"   uid=<code>{r['user_id']}</code> ip=<code>{r['ip_address']}</code>\n"
-            f"   {r['details']}\n"
+            f"   uid=<code>{r['user_id']}</code> ({flagged_display}) ip=<code>{r['ip_address']}</code>\n"
+            f"   {details}\n"
             f"   🕐 {r['logged_at']}"
         )
     await callback.message.edit_text(
@@ -3495,20 +3562,27 @@ async def api_verify(body: VerifyRequest, request: Request):
     if not fp_ok:
         return {"status": "blocked", "reason": "no_fingerprint"}
 
+    flagged_username = tg_user.get("username", "") or ""
+
     if await DataEngine.is_ip_banned(client_ip):
-        await DataEngine.log_fraud_attempt(uid, "banned_ip_attempt", client_ip)
+        await DataEngine.log_fraud_attempt(
+            uid, "banned_ip_attempt", client_ip,
+            f"flagged_username=@{flagged_username}" if flagged_username else "flagged_username=none"
+        )
         return {"status": "blocked", "reason": "banned_ip"}
 
     if await execute_network_vpn_lookup(client_ip):
         return {"status": "blocked", "reason": "vpn"}
 
-    should_ban, reason = await evaluate_clone_risk(
+    should_ban, reason, ban_detail = await evaluate_clone_risk(
         uid, ref, client_ip, body.fingerprint,
         body.tgPlatform, body.tgVersion, body.tgAppVersion,
         body.canvasHash, body.webglHash, body.screenSig,
+        flagged_username,
     )
     if should_ban:
-        await DataEngine.log_fraud_attempt(uid, reason, client_ip, "auto-blocked at verification")
+        detail = f"{ban_detail} — auto-blocked at verification" if ban_detail else "auto-blocked at verification"
+        await DataEngine.log_fraud_attempt(uid, reason, client_ip, detail)
         if reason == "ip_farm":
             await DataEngine.ban_ip(client_ip, reason)
         return {"status": "blocked", "reason": reason}
