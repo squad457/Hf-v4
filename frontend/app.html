@@ -679,7 +679,6 @@ function adsCardHTML(){
       <button class="btn" id="watchAdBtn" onclick="watchAd()" ${(!ADS.enabled || capped) ? "disabled" : ""}>
         ${capped ? "✅ Daily Limit Reached" : "▶️ Watch Ad"}
       </button>
-      ${capped ? "" : `<div class="mini" style="margin-top:8px;text-align:center;opacity:.85">⚠️ You must click on the ad while watching to receive your reward</div>`}
     `;
   })() : "";
 
