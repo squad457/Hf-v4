@@ -803,7 +803,7 @@ async function watchAd(){
     // /api/ads/claim checks if this attempt triggers the click reminder & reward control (2, 4, 6, 8, 10...)
     await api("/api/ads/claim", {});
   } catch (claimErr) {
-    const msg = claimErr?.message === "ad_click_reminder"      ? "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+    const msg = claimErr?.message === "ad_click_reminder"      ? "⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
               : claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
               : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
               : "❌ Couldn't start — try again";
@@ -874,7 +874,7 @@ async function watchAd(){
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
   } else {
-    toast("ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    toast("⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።");
   }
   await renderHome(document.getElementById("view"));
 }
