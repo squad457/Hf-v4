@@ -1388,13 +1388,17 @@ function copyLink(){
 function shareLink(){
   // Plain text share via Telegram's native "send to" picker — no inline
   // keyboard, no dependency on inline mode being enabled in BotFather.
+  // The link is embedded directly in the text (not passed as a separate
+  // `url` param) — otherwise Telegram prepends the link before the text
+  // instead of after it.
   const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
              + "✅ Complete simple tasks\n"
              + "✅ Watch short ads\n"
              + "✅ Invite friends for bonus rewards\n"
              + "✅ Withdraw straight to Telebirr\n\n"
-             + "Join now 👇";
-  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
+             + "Join now 👇\n"
+             + ME.referral_link;
+  const shareUrl = `https://t.me/share/url?url=&text=${encodeURIComponent(text)}`;
   tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
 }
 
