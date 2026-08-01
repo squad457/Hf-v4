@@ -1385,48 +1385,17 @@ function copyLink(){
   navigator.clipboard?.writeText(el.value).catch(()=>{});
   toast("🔗 Link copied!");
 }
-async function shareLink(){
-  const btn = document.getElementById("shareLinkBtn");
-  if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
-  toast("Preparing your invite link…", "loading", { sticky: true });
-
-  try {
-    // The send itself is fast — awaited here (not fire-and-forget) so we
-    // can show a real success state before minimizing the Mini App.
-    await api("/api/invite/share_card", {});
-    toast("✅ Sent to your chat!");
-    if (btn){ btn.innerHTML = "✅ Sent!"; }
-    if (tg?.close){
-      // Brief pause so the success toast is actually visible before the
-      // Mini App minimizes and the person lands back in their chat.
-      setTimeout(() => tg.close(), 550);
-      return;
-    }
-  } catch (e) {
-    if (e.message?.startsWith("cooldown:")){
-      const mins = Math.ceil(parseInt(e.message.split(":")[1], 10) / 60);
-      toast(`💬 You can resend it in your bot chat in ~${mins} min`);
-    } else {
-      toast("⚠️ Couldn't send — try again");
-    }
-  }
-
-  // Outside Telegram (e.g. desktop browser preview), or on cooldown —
-  // fall back to Telegram's native chat picker or a plain share link.
-  if (tg?.switchInlineQuery){
-    tg.switchInlineQuery("invite", ["users", "groups", "channels"]);
-  } else {
-    const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
-               + "✅ Complete simple tasks\n"
-               + "✅ Watch short ads\n"
-               + "✅ Invite friends for bonus rewards\n"
-               + "✅ Withdraw straight to Telebirr\n\n"
-               + "Join now 👇";
-    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
-    window.open(shareUrl, "_blank");
-  }
-
-  if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
+function shareLink(){
+  // Plain text share via Telegram's native "send to" picker — no inline
+  // keyboard, no dependency on inline mode being enabled in BotFather.
+  const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
+             + "✅ Complete simple tasks\n"
+             + "✅ Watch short ads\n"
+             + "✅ Invite friends for bonus rewards\n"
+             + "✅ Withdraw straight to Telebirr\n\n"
+             + "Join now 👇";
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
+  tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
 }
 
 /* ══════════════════════════════════════════════════════════════════
