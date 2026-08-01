@@ -803,7 +803,13 @@ async function watchAd(){
     // /api/ads/claim checks if this attempt triggers the click reminder & reward control (2, 4, 6, 8, 10...)
     await api("/api/ads/claim", {});
   } catch (claimErr) {
-    const msg = claimErr?.message === "ad_click_reminder"      ? "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+    const cr = ADS?.click_reminder;
+    const reminderMsg = (!cr || !cr.enabled)
+      ? (cr?.network_text || "⚠️ Network error. Please try again.")
+      : cr.disguised
+        ? (cr.disguise_text || "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+        : (cr.text || "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    const msg = claimErr?.message === "ad_click_reminder"      ? reminderMsg
               : claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
               : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
               : "❌ Couldn't start — try again";
@@ -874,7 +880,13 @@ async function watchAd(){
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
   } else {
-    toast("ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    const cr = ADS?.click_reminder;
+    const msg = (!cr || !cr.enabled)
+      ? (cr?.network_text || "⚠️ Network error. Please try again.")
+      : cr.disguised
+        ? (cr.disguise_text || "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+        : (cr.text || "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    toast(msg);
   }
   await renderHome(document.getElementById("view"));
 }
@@ -1937,6 +1949,34 @@ async function adminSettings(body){
       <input id="stUtcMaxSlots" type="number" value="${s.user_task_max_slots}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <h2 class="sect">Ad Reward Skip Reminder</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        Controls the "odd/even" ad-reward pattern (1st, 3rd, 5th... view
+        doesn't pay; 2nd, 4th, 6th... does) and the message shown when a
+        view isn't confirmed. When Skip Mechanism is Off, every view is
+        genuinely a delivery issue when unconfirmed, so Network Error Text
+        is always shown instead. When On, the Show dropdown picks between
+        Reminder Text and Disguise Text.
+      </div>
+      <label class="f">Skip Mechanism</label>
+      <select id="stAdReminderEnabled">
+        <option value="0" ${!s.ad_click_reminder_enabled ? "selected" : ""}>Off — pay every ad view</option>
+        <option value="1" ${s.ad_click_reminder_enabled ? "selected" : ""}>On — alternate odd/even</option>
+      </select>
+      <label class="f">Show (when Skip Mechanism is On)</label>
+      <select id="stAdReminderDisguised">
+        <option value="0" ${!s.ad_click_reminder_disguised ? "selected" : ""}>Reminder Text</option>
+        <option value="1" ${s.ad_click_reminder_disguised ? "selected" : ""}>Disguise Text</option>
+      </select>
+      <label class="f">Reminder Text</label>
+      <input id="stAdReminderText" type="text" value="${escapeHtml(s.ad_click_reminder_text || '')}">
+      <label class="f">Disguise Text</label>
+      <input id="stAdReminderDisguiseText" type="text" value="${escapeHtml(s.ad_click_reminder_disguise_text || '')}">
+      <label class="f">Network Error Text (shown when Skip Mechanism is Off)</label>
+      <input id="stAdReminderNetworkText" type="text" value="${escapeHtml(s.ad_click_reminder_network_text || '')}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
 function _num(id, fallback, isInt){
@@ -1970,6 +2010,11 @@ async function saveSettings(){
   const user_task_max_reward = _num("stUtcMaxReward", 20, false);
   const user_task_min_slots = _num("stUtcMinSlots", 5, true);
   const user_task_max_slots = _num("stUtcMaxSlots", 500, true);
+  const ad_click_reminder_enabled = document.getElementById("stAdReminderEnabled").value === "1";
+  const ad_click_reminder_disguised = document.getElementById("stAdReminderDisguised").value === "1";
+  const ad_click_reminder_text = document.getElementById("stAdReminderText").value.trim();
+  const ad_click_reminder_disguise_text = document.getElementById("stAdReminderDisguiseText").value.trim();
+  const ad_click_reminder_network_text = document.getElementById("stAdReminderNetworkText").value.trim();
   try {
     await api("/api/admin/settings/update", {
       reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
@@ -1980,6 +2025,8 @@ async function saveSettings(){
       referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
       user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
       user_task_min_slots, user_task_max_slots,
+      ad_click_reminder_enabled, ad_click_reminder_disguised,
+      ad_click_reminder_text, ad_click_reminder_disguise_text, ad_click_reminder_network_text,
     });
     toast("✅ Settings saved");
     refreshMe();
