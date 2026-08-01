@@ -930,13 +930,16 @@ class DataEngine:
 
     @staticmethod
     async def claim_video_ad_atomic(
-        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
+        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int,
+        skip_enabled: bool = True,
     ) -> tuple[bool, str]:
         """Re-checks the daily cap and cooldown AND records+pays the
         reward, all inside one BEGIN EXCLUSIVE transaction.
         Rule: Alternating ad attempts based on completed/warning count today.
         - 1st, 3rd, 5th, 7th... (Odd attempts): No pay, record warning.
-        - 2nd, 4th, 6th, 8th... (Even attempts): Pay out reward."""
+        - 2nd, 4th, 6th, 8th... (Even attempts): Pay out reward.
+        Pass skip_enabled=False (admin setting) to disable the odd/even
+        withholding entirely — every attempt then pays out normally."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
             try:
@@ -950,7 +953,7 @@ class DataEngine:
                 attempt_num = completed_or_warned + 1  # 1st ad = 1, 2nd ad = 2, 3rd ad = 3...
 
                 # Odd numbered attempts (1, 3, 5, 7...) trigger the click reminder & withhold reward
-                if attempt_num % 2 != 0:
+                if skip_enabled and attempt_num % 2 != 0:
                     await db.execute(
                         "INSERT INTO ad_events (user_id, kind, status, reward) "
                         "VALUES (?, 'video', 'warning', 0)",
@@ -3807,6 +3810,12 @@ async def api_ads_status(body: ApiBase):
     monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
     monetag_sdk_url = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
 
+    reminder_enabled   = (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1"
+    reminder_disguised = (await DataEngine.get_setting("ad_click_reminder_disguised", "0")) == "1"
+    reminder_text      = await DataEngine.get_setting("ad_click_reminder_text", "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ")
+    reminder_disguise_text = await DataEngine.get_setting("ad_click_reminder_disguise_text", "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+    reminder_network_text  = await DataEngine.get_setting("ad_click_reminder_network_text", "⚠️ Network error. Please try again.")
+
     return {
         "enabled": ads_enabled and bool(block_id or monetag_zone_id),
         "block_id": block_id,
@@ -3814,6 +3823,13 @@ async def api_ads_status(body: ApiBase):
         "daily_limit": daily_limit,
         "watched_today": watched_today,
         "seconds_left": seconds_left,
+        "click_reminder": {
+            "enabled": reminder_enabled,
+            "disguised": reminder_disguised,
+            "text": reminder_text,
+            "disguise_text": reminder_disguise_text,
+            "network_text": reminder_network_text,
+        },
         "monetag": {
             "zone_id": monetag_zone_id,
             "sdk_url": monetag_sdk_url,
@@ -3880,8 +3896,9 @@ async def api_ads_adsgram_reward(userid: int, secret: Optional[str] = None):
     daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
     cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
     reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+    reminder_enabled = (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1"
 
-    ok, _ = await DataEngine.claim_video_ad_atomic(userid, reward_amount, daily_limit, cooldown_seconds)
+    ok, _ = await DataEngine.claim_video_ad_atomic(userid, reward_amount, daily_limit, cooldown_seconds, reminder_enabled)
     return {"ok": ok}
 
 
@@ -4586,6 +4603,19 @@ async def api_admin_settings(body: ApiBase):
         "user_task_max_slots": _safe_int(await DataEngine.get_setting("user_task_max_slots", "500"), 500),
         # Support contact — shown as a floating support button in the dashboard
         "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
+        # Ad-view reward-skip reminder (the message shown when a claim is
+        # withheld by the odd/even skip pattern)
+        "ad_click_reminder_enabled": (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1",
+        "ad_click_reminder_disguised": (await DataEngine.get_setting("ad_click_reminder_disguised", "0")) == "1",
+        "ad_click_reminder_text": await DataEngine.get_setting(
+            "ad_click_reminder_text", "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+        ),
+        "ad_click_reminder_disguise_text": await DataEngine.get_setting(
+            "ad_click_reminder_disguise_text", "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+        ),
+        "ad_click_reminder_network_text": await DataEngine.get_setting(
+            "ad_click_reminder_network_text", "⚠️ Network error. Please try again."
+        ),
     }
 
 
@@ -4617,6 +4647,11 @@ class AdminSettingsUpdateRequest(ApiBase):
     support_username: str = ""
     ticker_enabled: bool = True
     ticker_custom_names: str = "[]"
+    ad_click_reminder_enabled: bool = True
+    ad_click_reminder_disguised: bool = False
+    ad_click_reminder_text: str = "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+    ad_click_reminder_disguise_text: str = "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+    ad_click_reminder_network_text: str = "⚠️ Network error. Please try again."
 
 
 @api_app.post("/api/admin/settings/update")
@@ -4650,6 +4685,11 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     await DataEngine.set_setting("ticker_enabled", "1" if body.ticker_enabled else "0")
     await DataEngine.set_setting("ticker_custom_names", body.ticker_custom_names)
+    await DataEngine.set_setting("ad_click_reminder_enabled", "1" if body.ad_click_reminder_enabled else "0")
+    await DataEngine.set_setting("ad_click_reminder_disguised", "1" if body.ad_click_reminder_disguised else "0")
+    await DataEngine.set_setting("ad_click_reminder_text", body.ad_click_reminder_text.strip() or "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ")
+    await DataEngine.set_setting("ad_click_reminder_disguise_text", body.ad_click_reminder_disguise_text.strip() or "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+    await DataEngine.set_setting("ad_click_reminder_network_text", body.ad_click_reminder_network_text.strip() or "⚠️ Network error. Please try again.")
     return {"ok": True}
 
 
