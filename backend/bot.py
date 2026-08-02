@@ -3966,6 +3966,9 @@ async def api_dailycheck_status(body: ApiBase):
     uid = user["user_id"]
     enabled = (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1"
     reward  = float(await DataEngine.get_setting("daily_checkin_reward", "5"))
+    reminder_text = await DataEngine.get_setting(
+        "daily_checkin_reminder_text", "⚠️ Couldn't confirm your ad view — try again in a moment"
+    )
     status  = await DataEngine.get_daily_checkin_status(uid)
     return {
         "enabled": enabled,
@@ -3973,6 +3976,7 @@ async def api_dailycheck_status(body: ApiBase):
         "claimed_today": status["claimed_today"],
         "streak": status["streak"],
         "ad_watched_recently": await DataEngine.has_recent_completed_ad(uid),
+        "reminder_text": reminder_text,
     }
 
 
@@ -4774,6 +4778,9 @@ async def api_admin_settings(body: ApiBase):
         ),
         "daily_checkin_enabled": (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1",
         "daily_checkin_reward": float(await DataEngine.get_setting("daily_checkin_reward", "5")),
+        "daily_checkin_reminder_text": await DataEngine.get_setting(
+            "daily_checkin_reminder_text", "⚠️ Couldn't confirm your ad view — try again in a moment"
+        ),
     }
 
 
@@ -4812,6 +4819,7 @@ class AdminSettingsUpdateRequest(ApiBase):
     ad_click_reminder_network_text: str = "⚠️ Network error. Please try again."
     daily_checkin_enabled: bool = True
     daily_checkin_reward: float = 5
+    daily_checkin_reminder_text: str = "⚠️ Couldn't confirm your ad view — try again in a moment"
 
 
 @api_app.post("/api/admin/settings/update")
@@ -4852,6 +4860,7 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("ad_click_reminder_network_text", body.ad_click_reminder_network_text.strip() or "⚠️ Network error. Please try again.")
     await DataEngine.set_setting("daily_checkin_enabled", "1" if body.daily_checkin_enabled else "0")
     await DataEngine.set_setting("daily_checkin_reward", str(body.daily_checkin_reward))
+    await DataEngine.set_setting("daily_checkin_reminder_text", body.daily_checkin_reminder_text.strip() or "⚠️ Couldn't confirm your ad view — try again in a moment")
     return {"ok": True}
 
 
