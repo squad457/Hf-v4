@@ -474,6 +474,16 @@ label.f { font-size: 0.68rem; color: var(--ink-dim); font-weight: 700; margin-bo
   animation: confettiBurst var(--dur) cubic-bezier(0.16, 1, 0.3, 1) forwards;
   will-change: transform, opacity;
 }
+@keyframes confettiRain {
+  0%   { transform: translate(0, -10vh) rotate(0deg); opacity: 1; }
+  100% { transform: translate(var(--dxr), 115vh) rotate(var(--rotr)); opacity: 0.85; }
+}
+.confetti-rain-bit {
+  position: absolute; top: 0; width: var(--sz); height: var(--sz);
+  background: var(--col); border-radius: var(--rad);
+  animation: confettiRain var(--dur) linear forwards;
+  will-change: transform, opacity;
+}
 @keyframes rocketLaunch {
   0%   { transform: translate(-50%, 40vh) rotate(0deg) scale(.4); opacity: 0; }
   15%  { opacity: 1; }
@@ -617,6 +627,26 @@ function celebrateBurst(){
   document.body.appendChild(rocket);
   rocket.addEventListener("animationend", () => rocket.remove());
   setTimeout(() => rocket.remove(), 1400);
+
+  // Falling "rain" of confetti from the top of the screen, on top of the
+  // center burst above — pieces spawn across the full width and drift
+  // down with a slight rotation, like scattered confetti raining down.
+  const rainCount = 28;
+  for (let i = 0; i < rainCount; i++){
+    const bit = document.createElement("div");
+    bit.className = "confetti-rain-bit";
+    bit.style.left = `${Math.random() * 100}%`;
+    bit.style.setProperty("--dxr", `${(Math.random() * 60 - 30).toFixed(0)}px`);
+    bit.style.setProperty("--rotr", `${(Math.random() * 720 - 360).toFixed(0)}deg`);
+    bit.style.setProperty("--sz", `${5 + Math.random() * 6}px`);
+    bit.style.setProperty("--rad", Math.random() > 0.5 ? "50%" : "2px");
+    bit.style.setProperty("--dur", `${(1600 + Math.random() * 900).toFixed(0)}ms`);
+    bit.style.setProperty("--col", colors[i % colors.length]);
+    bit.style.animationDelay = `${(Math.random() * 300).toFixed(0)}ms`;
+    layer.appendChild(bit);
+    bit.addEventListener("animationend", () => bit.remove());
+    setTimeout(() => bit.remove(), 3200); // safety net in case animationend never fires
+  }
 
   tg?.HapticFeedback?.notificationOccurred("success");
 }
@@ -2178,6 +2208,21 @@ async function adminSettings(body){
       <input id="stAdReminderNetworkText" type="text" value="${escapeHtml(s.ad_click_reminder_network_text || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <h2 class="sect">Daily Check-in</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        Once-a-day bonus: user watches one ad, then claims a fixed reward.
+        Streak count increases on consecutive days.
+      </div>
+      <label class="f">Enabled</label>
+      <select id="stDailyCheckEnabled">
+        <option value="0" ${!s.daily_checkin_enabled ? "selected" : ""}>Off</option>
+        <option value="1" ${s.daily_checkin_enabled ? "selected" : ""}>On</option>
+      </select>
+      <label class="f">Reward per Check-in (Birr)</label>
+      <input id="stDailyCheckReward" type="number" step="0.1" value="${s.daily_checkin_reward}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
 function _num(id, fallback, isInt){
@@ -2216,6 +2261,8 @@ async function saveSettings(){
   const ad_click_reminder_text = document.getElementById("stAdReminderText").value.trim();
   const ad_click_reminder_disguise_text = document.getElementById("stAdReminderDisguiseText").value.trim();
   const ad_click_reminder_network_text = document.getElementById("stAdReminderNetworkText").value.trim();
+  const daily_checkin_enabled = document.getElementById("stDailyCheckEnabled").value === "1";
+  const daily_checkin_reward = _num("stDailyCheckReward", 5, false);
   try {
     await api("/api/admin/settings/update", {
       reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
@@ -2228,6 +2275,7 @@ async function saveSettings(){
       user_task_min_slots, user_task_max_slots,
       ad_click_reminder_enabled, ad_click_reminder_disguised,
       ad_click_reminder_text, ad_click_reminder_disguise_text, ad_click_reminder_network_text,
+      daily_checkin_enabled, daily_checkin_reward,
     });
     toast("✅ Settings saved");
     refreshMe();
