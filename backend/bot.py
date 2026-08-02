@@ -3294,6 +3294,7 @@ async def process_broadcast_button_prompt(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="🎬 Watch Ads Now", callback_data="bc_btn_watch")],
         [InlineKeyboardButton(text="🎁 Invite & Earn Rewards", callback_data="bc_btn_invite")],
         [InlineKeyboardButton(text="🎯 Complete Tasks & Earn", callback_data="bc_btn_tasks")],
+        [InlineKeyboardButton(text="🎁 Claim Daily Bonus", callback_data="bc_btn_daily")],
         [InlineKeyboardButton(text="📱 Open Mini App", callback_data="bc_btn_app")],
         [InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")]
     ])
@@ -3307,6 +3308,7 @@ async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
         "bc_btn_watch": "🎬 Watch Ads Now",
         "bc_btn_invite": "🎁 Invite & Earn Rewards",
         "bc_btn_tasks": "🎯 Complete Tasks & Earn",
+        "bc_btn_daily": "🎁 Claim Daily Bonus",
         "bc_btn_app": "📱 Open Mini App"
     }
     btn_text = btn_map.get(action, "📱 Open Mini App")
