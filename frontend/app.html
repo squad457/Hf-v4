@@ -866,7 +866,7 @@ async function dailyCheckIn(){
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(claimedReward)} Birr — 🔥 ${streak} day streak!`);
   } else {
-    toast("⚠️ Couldn't confirm your ad view — try again in a moment");
+    toast(DAILY?.reminder_text || "⚠️ Couldn't confirm your ad view — try again in a moment");
   }
   await renderHome(document.getElementById("view"));
 }
@@ -2221,6 +2221,8 @@ async function adminSettings(body){
       </select>
       <label class="f">Reward per Check-in (Birr)</label>
       <input id="stDailyCheckReward" type="number" step="0.1" value="${s.daily_checkin_reward}">
+      <label class="f">"Couldn't Confirm" Message</label>
+      <input id="stDailyCheckReminderText" type="text" value="${escapeHtml(s.daily_checkin_reminder_text || '')}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
   `;
@@ -2263,6 +2265,7 @@ async function saveSettings(){
   const ad_click_reminder_network_text = document.getElementById("stAdReminderNetworkText").value.trim();
   const daily_checkin_enabled = document.getElementById("stDailyCheckEnabled").value === "1";
   const daily_checkin_reward = _num("stDailyCheckReward", 5, false);
+  const daily_checkin_reminder_text = document.getElementById("stDailyCheckReminderText").value.trim();
   try {
     await api("/api/admin/settings/update", {
       reward_per_referral, min_withdrawal, min_ads_for_withdrawal, support_username,
@@ -2275,7 +2278,7 @@ async function saveSettings(){
       user_task_min_slots, user_task_max_slots,
       ad_click_reminder_enabled, ad_click_reminder_disguised,
       ad_click_reminder_text, ad_click_reminder_disguise_text, ad_click_reminder_network_text,
-      daily_checkin_enabled, daily_checkin_reward,
+      daily_checkin_enabled, daily_checkin_reward, daily_checkin_reminder_text,
     });
     toast("✅ Settings saved");
     refreshMe();
