@@ -236,6 +236,12 @@ CREATE TABLE IF NOT EXISTS fraud_log (
     logged_at   TEXT    DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS daily_checkins (
+    user_id         INTEGER PRIMARY KEY,
+    last_claim_date TEXT,
+    streak          INTEGER DEFAULT 0
+);
+
 -- Durable (DB-backed) stand-in for the old FSMContext-only
 -- "stashed_referrer_id". A person can sit on the "join these channels
 -- first" screen for a long time before tapping Joined, and the bot's
@@ -392,6 +398,11 @@ MIGRATION_STATEMENTS = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, reason TEXT, ip_address TEXT,
         details TEXT DEFAULT '', logged_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS daily_checkins (
+        user_id INTEGER PRIMARY KEY,
+        last_claim_date TEXT,
+        streak INTEGER DEFAULT 0
     )""",
 ]
 
@@ -999,6 +1010,82 @@ class DataEngine:
                 )
                 await db.execute("COMMIT")
                 return True, ""
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    async def get_daily_checkin_status(user_id: int) -> dict:
+        """Returns whether today's check-in is already claimed, and the
+        current streak, without touching anything."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT last_claim_date, streak FROM daily_checkins WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if not row:
+            return {"claimed_today": False, "streak": 0}
+        return {"claimed_today": row["last_claim_date"] == today, "streak": row["streak"] or 0}
+
+    @staticmethod
+    async def has_recent_completed_ad(user_id: int, within_seconds: int = 180) -> bool:
+        """Daily check-in requires actually watching an ad first — this
+        checks for a genuinely S2S-confirmed ad view (kind='video',
+        status='completed') in the last `within_seconds`, the same trust
+        model already used for the regular Watch Ad reward, so check-in
+        can't be claimed without really watching something."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT completed_at FROM ad_events WHERE user_id=? AND kind='video' "
+                "AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return False
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")).total_seconds()
+            return 0 <= elapsed <= within_seconds
+        except Exception:
+            return False
+
+    @staticmethod
+    async def claim_daily_checkin_atomic(user_id: int, reward: float) -> tuple[bool, str, int]:
+        """Re-checks 'not already claimed today' AND pays the reward, all
+        inside one BEGIN EXCLUSIVE transaction — same double-claim
+        protection pattern as withdrawals. Streak continues if the last
+        claim was yesterday, otherwise resets to 1.
+        Returns (ok, reason, new_streak)."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT last_claim_date, streak FROM daily_checkins WHERE user_id=?",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                if row and row[0] == today:
+                    await db.execute("ROLLBACK")
+                    return False, "already_claimed", row[1] or 0
+
+                new_streak = ((row[1] or 0) + 1) if (row and row[0] == yesterday) else 1
+
+                await db.execute(
+                    "INSERT INTO daily_checkins (user_id, last_claim_date, streak) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET last_claim_date=excluded.last_claim_date, streak=excluded.streak",
+                    (user_id, today, new_streak),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                    (reward, user_id),
+                )
+                await db.execute("COMMIT")
+                return True, "", new_streak
             except Exception:
                 await db.execute("ROLLBACK")
                 raise
@@ -3872,6 +3959,49 @@ async def api_ads_status(body: ApiBase):
     }
 
 
+# ── /api/dailycheck — watch one ad, then claim a once-a-day bonus ────────
+@api_app.post("/api/dailycheck/status")
+async def api_dailycheck_status(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    enabled = (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1"
+    reward  = float(await DataEngine.get_setting("daily_checkin_reward", "5"))
+    status  = await DataEngine.get_daily_checkin_status(uid)
+    return {
+        "enabled": enabled,
+        "reward": reward,
+        "claimed_today": status["claimed_today"],
+        "streak": status["streak"],
+        "ad_watched_recently": await DataEngine.has_recent_completed_ad(uid),
+    }
+
+
+@api_app.post("/api/dailycheck/claim")
+async def api_dailycheck_claim(body: ApiBase):
+    """Requires a genuinely S2S-confirmed ad view (see
+    has_recent_completed_ad) in the last few minutes before the once-daily
+    bonus can be claimed — same trust model as the regular ad reward, so
+    this can't be claimed by just calling the API without watching
+    anything."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    enabled = (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1"
+    if not enabled:
+        raise HTTPException(status_code=400, detail="disabled")
+
+    if not await DataEngine.has_recent_completed_ad(uid):
+        raise HTTPException(status_code=400, detail="watch_ad_first")
+
+    reward = float(await DataEngine.get_setting("daily_checkin_reward", "5"))
+    ok, reason, streak = await DataEngine.claim_daily_checkin_atomic(uid, reward)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+
+    fresh = await DataEngine.get_user(uid)
+    return {"status": "claimed", "reward": reward, "streak": streak, "balance": float(fresh["balance"])}
+
+
 @api_app.post("/api/ads/claim")
 async def api_ads_claim(body: ApiBase):
     """Advisory pre-check — allows showing the ad, while reward payout
@@ -4642,6 +4772,8 @@ async def api_admin_settings(body: ApiBase):
         "ad_click_reminder_network_text": await DataEngine.get_setting(
             "ad_click_reminder_network_text", "⚠️ Network error. Please try again."
         ),
+        "daily_checkin_enabled": (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1",
+        "daily_checkin_reward": float(await DataEngine.get_setting("daily_checkin_reward", "5")),
     }
 
 
@@ -4678,6 +4810,8 @@ class AdminSettingsUpdateRequest(ApiBase):
     ad_click_reminder_text: str = "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
     ad_click_reminder_disguise_text: str = "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
     ad_click_reminder_network_text: str = "⚠️ Network error. Please try again."
+    daily_checkin_enabled: bool = True
+    daily_checkin_reward: float = 5
 
 
 @api_app.post("/api/admin/settings/update")
@@ -4716,6 +4850,8 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("ad_click_reminder_text", body.ad_click_reminder_text.strip() or "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ")
     await DataEngine.set_setting("ad_click_reminder_disguise_text", body.ad_click_reminder_disguise_text.strip() or "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
     await DataEngine.set_setting("ad_click_reminder_network_text", body.ad_click_reminder_network_text.strip() or "⚠️ Network error. Please try again.")
+    await DataEngine.set_setting("daily_checkin_enabled", "1" if body.daily_checkin_enabled else "0")
+    await DataEngine.set_setting("daily_checkin_reward", str(body.daily_checkin_reward))
     return {"ok": True}
 
 
