@@ -1355,11 +1355,23 @@ class DataEngine:
 #
 # DECISION (ከ ANY ነባር user ጋር ሲነጻጸር)፦
 #   • Self-referral (referrer_id == new_user_id)        → BAN (ሁልጊዜ ግልጽ ነው)
-#   • Score ≥ 3/4 ምድቦች ከአንድ ተመሳሳይ user ጋር ይገጣጠማሉ        → BAN
-#   • Score 1-2                                          → LOG ብቻ (admin review)
-#   • referrer ጋር ብቻ: ከ fingerprint, IP, hardware ውስጥ ማንኛውም 2ቱ
-#     ይገጣጠማሉ                                             → BAN ("ራሱ ራሱን ጋበዘ")
-#   • referrer ጋር ከ 3ቱ ውስጥ 1 ብቻ ይገጣጠማል                    → LOG ብቻ
+#   • Weighted score ≥ 4/6 possible points, correlating to the SAME other
+#     user                                                    → BAN
+#     (fingerprint=2, hardware=1, ip=1, tg_device=1 — the combined
+#     `fingerprint` hash is far more unique than any single sub-signal, since
+#     it also folds in the full User-Agent string, timezone, cpu core count,
+#     and language; `hardware` alone is just canvas+webgl and, on its own,
+#     commonly collides across totally unrelated people who own the same
+#     inexpensive phone model; `ip` and `tg_device` collide even more easily
+#     — shared WiFi/CGNAT and "everyone's on the same Telegram Android
+#     build" are both completely normal. Requiring the strong fingerprint
+#     signal (or hardware) to be part of the match, not just any 3 weak
+#     signals, keeps two unrelated people who happen to share a phone model
+#     + network + app version from being auto-banned.)
+#   • Score 1-3                                          → LOG ብቻ (admin review)
+#   • referrer ጋር ብቻ: fingerprint=2, ip=1, hw=1 — ድምር ≥ 3 ሲደርስ         → BAN
+#     ("ራሱ ራሱን ጋበዘ")
+#   • referrer ጋር ድምር < 3                                  → LOG ብቻ
 #   • IP farm: ብዙ users በአንድ IP ላይ *እና* ጥቂት የተለያዩ
 #     fingerprints (ስለዚህ duplicate ስክሪፕት farm ይመስላል)      → BAN
 #     ብዙ users በአንድ IP ላይ ግን እያንዳንዱ የተለየ fingerprint
@@ -1369,10 +1381,18 @@ class DataEngine:
 # ስልክ ሞዴል ብቻ) ብቻውን ሰውን አያስታግድም።
 # ─────────────────────────────────────────────────────────────────────────────
 
-CORRELATION_BAN_THRESHOLD = 3   # ከ 4ቱ ምድቦች ቢያንስ 3 ሲገጣጠሙ ብቻ BAN
+CORRELATION_BAN_THRESHOLD = 4   # ከ 6 ሊደረስ ከሚችል ድምር ውስጥ ቢያንስ 4 ሲደርስ ብቻ BAN
 MAX_USERS_PER_IP          = 10  # ከዚህ በላይ → ጠቅሰ ብቻ (review)
 MAX_USERS_PER_IP_BAN      = 40  # ከዚህ በላይ *እና* ዝቅተኛ fingerprint diversity → BAN
 IP_FARM_MIN_FP_RATIO      = 0.5 # distinct_fp / user_count ከዚህ በታች ከሆነ "duplicate ስክሪፕት" ይመስላል
+
+# Per-category weights — fingerprint (the combined hash) is far more
+# unique than any single sub-signal and therefore worth more toward the
+# ban threshold. See the comment block above for why.
+WEIGHT_FINGERPRINT = 2
+WEIGHT_HARDWARE    = 1
+WEIGHT_IP          = 1
+WEIGHT_TG_DEVICE   = 1
 
 
 def _category_match_score(
@@ -1382,20 +1402,21 @@ def _category_match_score(
     tg_platform: str, tg_version: str, tg_ok: bool,
     row: dict,
 ) -> tuple[int, list]:
-    """Counts how many independent signal categories match a single candidate row."""
+    """Weighted sum of how many independent signal categories match a
+    single candidate row — see WEIGHT_* constants above."""
     score = 0
     matched = []
     if fp_ok and row.get("fingerprint") and row["fingerprint"] == fingerprint:
-        score += 1
+        score += WEIGHT_FINGERPRINT
         matched.append("fingerprint")
     if hw_ok and row.get("canvas_hash") == canvas_hash and row.get("webgl_hash") == webgl_hash:
-        score += 1
+        score += WEIGHT_HARDWARE
         matched.append("hardware")
     if ip_ok and row.get("ip_address") and row["ip_address"] == client_ip:
-        score += 1
+        score += WEIGHT_IP
         matched.append("ip")
     if tg_ok and row.get("tg_platform") == tg_platform and row.get("tg_version") == tg_version:
-        score += 1
+        score += WEIGHT_TG_DEVICE
         matched.append("tg_device")
     return score, matched
 
@@ -1490,10 +1511,11 @@ async def evaluate_clone_risk(
             )
 
     # ── 3. Referrer device check ────────────────────────────────────────
-    #    Needs fingerprint match PLUS (IP or hardware) match against the
-    #    referrer specifically — a single matching signal with the referrer
-    #    alone (e.g. just sharing IP, just sharing fingerprint) is normal
-    #    for family/friends and is only logged.
+    #    Weighted score ≥ 3 against the referrer specifically (fingerprint=2,
+    #    ip=1, hardware=1) — needs the strong fingerprint signal plus one
+    #    more, since ip+hardware alone (=2, no fingerprint match) isn't
+    #    enough. A single matching signal alone (e.g. just sharing IP, just
+    #    sharing hardware) is normal for family/friends and is only logged.
     if referrer_id and (fp_ok or ip_ok or hw_ok):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -1515,15 +1537,19 @@ async def evaluate_clone_risk(
                     and inv_row["webgl_hash"] == webgl_hash
                 )
 
-                ref_score = sum([fp_matches_ref, ip_matches_ref, hw_matches_ref])
+                ref_score = (
+                    (WEIGHT_FINGERPRINT if fp_matches_ref else 0)
+                    + (WEIGHT_IP if ip_matches_ref else 0)
+                    + (WEIGHT_HARDWARE if hw_matches_ref else 0)
+                )
 
-                # Any 2-out-of-3 signals matching the referrer (fingerprint,
-                # IP, or hardware) is treated as the same person referring
-                # themselves via a second account — auto-ban. A single
-                # matching signal alone (e.g. just shared IP/WiFi, or just
-                # shared fingerprint) stays log-only, since that alone is
-                # normal for real friends/family.
-                if ref_score >= 2:
+                # Weighted like the main correlation check above: fingerprint
+                # counts double since it's far more unique than IP or
+                # hardware alone. Threshold 3 means either fingerprint +
+                # one more signal, or all three weaker signals combined
+                # (ip+hw alone = 2, not enough — two unrelated people on the
+                # same phone model + shared network shouldn't auto-ban).
+                if ref_score >= 3:
                     logger.warning(
                         f"[FRAUD] Multi-signal match with referrer — banning: "
                         f"ref={referrer_id} new={new_user_id} "
@@ -1533,7 +1559,7 @@ async def evaluate_clone_risk(
                         f"referrer={referrer_id} fp={fp_matches_ref} "
                         f"ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score} {uname_tag}"
                     )
-                elif ref_score == 1:
+                elif ref_score >= 1:
                     logger.warning(
                         f"[FRAUD-WARN] Single-signal match with referrer (not banning): "
                         f"ref={referrer_id} new={new_user_id} "
