@@ -2648,7 +2648,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await callback.message.edit_text(
-        "📨 <b>Withdrawal Submitted!</b> Processing within 2-24 hours.",
+        "📨 <b>Withdrawal Submitted!</b> Processing within 24-48 hours.",
         reply_markup=generate_dashboard_matrix(uid)
     )
 
