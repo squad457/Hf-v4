@@ -1086,7 +1086,6 @@ async function watchAd(){
   }
 
   if (confirmed){
-    celebrateBurst();
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
   } else {
@@ -1141,7 +1140,6 @@ async function openDirectLinkAd(){
     if (btn){ btn.disabled = true; btn.textContent = "Claiming…"; }
     try {
       const r = await api("/api/ads/direct-link/claim", { event_id: res.event_id });
-      celebrateBurst();
       tg?.HapticFeedback?.notificationOccurred("success");
       toast(`✅ +${fmt(r.credited)} Birr credited`);
     } catch (claimErr) {
