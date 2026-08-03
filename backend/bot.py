@@ -1834,6 +1834,30 @@ async def debug_log_all_callbacks(handler, event: CallbackQuery, data):
     try:
         return await handler(event, data)
     except Exception as e:
+        err_str = str(e)
+        # These happen constantly when a user double/triple-taps a button
+        # fast (which is exactly what causes the popup the user is
+        # complaining about): the handler's actual work (send/update/etc.)
+        # already went through on the first tap — Telegram is just
+        # rejecting the *second* tap's redundant edit_text/answer call
+        # because nothing changed, the query is stale, or the message was
+        # already replaced. None of these indicate a real failure, so stay
+        # silent instead of alarming the user with "Internal error".
+        benign_markers = (
+            "message is not modified",
+            "query is too old",
+            "query id is invalid",
+            "message to edit not found",
+            "message can't be edited",
+            "message to delete not found",
+        )
+        if any(marker in err_str.lower() for marker in benign_markers):
+            logger.info(f"[CALLBACK-BENIGN] uid={event.from_user.id} data={event.data!r}: {e}")
+            try:
+                await event.answer()
+            except Exception:
+                pass
+            return
         logger.exception(f"[CALLBACK-ERROR] uid={event.from_user.id} data={event.data!r}: {e}")
         try:
             await event.answer("⚠️ Internal error, please try again.", show_alert=True)
