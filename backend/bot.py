@@ -78,6 +78,20 @@ FRONTEND_URL         = os.getenv("FRONTEND_URL", "").rstrip("/") or WEBAPP_URL
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
 DB_PATH               = os.getenv("DB_PATH", "referral_bot.db")
+
+# Broadcast throttling — Telegram flood-limits bots that blast messages too
+# fast. 0.05s (20 msg/sec) was too aggressive and triggered RetryAfter a lot.
+# Slower pacing + a periodic longer pause keeps delivery smooth and reliable.
+BROADCAST_DELAY        = float(os.getenv("BROADCAST_DELAY", "0.35"))   # per-message delay (~3 msg/sec)
+BROADCAST_BATCH_SIZE   = int(os.getenv("BROADCAST_BATCH_SIZE", "25"))  # extra pause every N messages
+BROADCAST_BATCH_PAUSE  = float(os.getenv("BROADCAST_BATCH_PAUSE", "2.0"))
+
+# Guards against a broadcast being triggered twice at once (e.g. admin
+# double-taps "Send Now", or the API endpoint gets called twice in a row)
+# which would otherwise fire two overlapping loops and double-send to
+# every single user. Only one broadcast may run at a time.
+_broadcast_lock = asyncio.Lock()
+_broadcast_running = False
 TASK_JOIN_WAIT_SECONDS = int(os.getenv("TASK_JOIN_WAIT_SECONDS", "5"))
 
 # How old a Telegram WebApp initData payload is allowed to be before we
@@ -2280,24 +2294,28 @@ async def notify_ad_limit_reset_loop():
                 inactive_users = [r["user_id"] for r in await cur2.fetchall()]
 
             sent_limit, failed_limit, skipped_limit = 0, 0, 0
-            for uid in limit_reached_users:
+            for i, uid in enumerate(limit_reached_users, start=1):
                 if await DataEngine.mark_notified_today(uid, "ads_reset_limit"):
                     ok = await send_ads_limit_reset_reminder(uid)
                     sent_limit += 1 if ok else 0
                     failed_limit += 0 if ok else 1
-                    await asyncio.sleep(0.3)
                 else:
                     skipped_limit += 1
+                await asyncio.sleep(BROADCAST_DELAY)
+                if i % BROADCAST_BATCH_SIZE == 0:
+                    await asyncio.sleep(BROADCAST_BATCH_PAUSE)
 
             sent_earn, failed_earn, skipped_earn = 0, 0, 0
-            for uid in inactive_users:
+            for i, uid in enumerate(inactive_users, start=1):
                 if await DataEngine.mark_notified_today(uid, "ads_start_earn"):
                     ok = await send_ads_start_earning_reminder(uid)
                     sent_earn += 1 if ok else 0
                     failed_earn += 0 if ok else 1
-                    await asyncio.sleep(0.3)
                 else:
                     skipped_earn += 1
+                await asyncio.sleep(BROADCAST_DELAY)
+                if i % BROADCAST_BATCH_SIZE == 0:
+                    await asyncio.sleep(BROADCAST_BATCH_PAUSE)
 
             await report_ads_reset_broadcast_to_admins(
                 sent_limit, failed_limit, skipped_limit,
@@ -3332,42 +3350,71 @@ async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
 
 @core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
 async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
+    global _broadcast_running
+    if _broadcast_running:
+        await callback.answer("⚠️ A broadcast is already in progress — please wait for it to finish.", show_alert=True)
+        return
+    async with _broadcast_lock:
+        if _broadcast_running:
+            await callback.answer("⚠️ A broadcast is already in progress — please wait for it to finish.", show_alert=True)
+            return
+        _broadcast_running = True
+    await callback.answer()
+
     s    = await state.get_data()
     text = s["bc_payload"]
     btn_text = s.get("bc_btn_text", "📱 Open Mini App")
     await state.clear()
     progress = await callback.message.edit_text("⏳ Sending broadcast with custom button...")
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur   = await db.execute("SELECT user_id FROM users")
-        nodes = await cur.fetchall()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur   = await db.execute("SELECT user_id FROM users")
+            nodes = await cur.fetchall()
+    except Exception:
+        _broadcast_running = False
+        raise
         
     sent_count = 0
     fail_count = 0
-    for (uid,) in nodes:
-        try:
-            url = f"{FRONTEND_URL}/app.html?uid={uid}"
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=url))
-            ]])
-            await bot.send_message(uid, text, reply_markup=markup)
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            err_str = str(e)
-            if "RetryAfter" in err_str:
-                try:
-                    wait = int(''.join(filter(str.isdigit, err_str))) + 1
-                except Exception:
-                    wait = 30
-                await asyncio.sleep(wait)
-                try:
-                    await bot.send_message(uid, text)
-                    sent_count += 1
-                except Exception:
+    try:
+        for i, (uid,) in enumerate(nodes, start=1):
+            try:
+                url = f"{FRONTEND_URL}/app.html?uid={uid}"
+                markup = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=url))
+                ]])
+                await bot.send_message(uid, text, reply_markup=markup)
+                sent_count += 1
+            except Exception as e:
+                err_str = str(e)
+                if "RetryAfter" in err_str:
+                    try:
+                        wait = int(''.join(filter(str.isdigit, err_str))) + 1
+                    except Exception:
+                        wait = 30
+                    await asyncio.sleep(wait)
+                    try:
+                        await bot.send_message(uid, text)
+                        sent_count += 1
+                    except Exception:
+                        fail_count += 1
+                else:
                     fail_count += 1
-            else:
-                fail_count += 1
+
+            # Pace the broadcast so we don't trip Telegram's flood limits: a
+            # small delay after every message, plus a longer breather every
+            # BROADCAST_BATCH_SIZE messages.
+            await asyncio.sleep(BROADCAST_DELAY)
+            if i % BROADCAST_BATCH_SIZE == 0:
+                await asyncio.sleep(BROADCAST_BATCH_PAUSE)
+                try:
+                    await progress.edit_text(f"⏳ Sending broadcast... {i}/{len(nodes)} sent so far.")
+                except Exception:
+                    pass
+    finally:
+        _broadcast_running = False
+
     try:
         await progress.delete()
     except Exception:
@@ -3541,31 +3588,47 @@ async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup |
     """Shared broadcast sender — used by /api/admin/broadcast (free-text
     announcements) and /api/admin/tasks/broadcast (new-task announcements
     with an Open App button)."""
+    global _broadcast_running
+    if _broadcast_running:
+        raise HTTPException(status_code=409, detail="broadcast_already_in_progress")
+    async with _broadcast_lock:
+        if _broadcast_running:
+            raise HTTPException(status_code=409, detail="broadcast_already_in_progress")
+        _broadcast_running = True
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id FROM users")
         rows = await cur.fetchall()
     sent, failed = 0, 0
-    for (uid,) in rows:
-        try:
-            markup = reply_markup if reply_markup else generate_app_webapp_button(uid)
-            await bot.send_message(uid, text, reply_markup=markup)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            err_str = str(e)
-            if "RetryAfter" in err_str:
-                try:
-                    wait = int("".join(filter(str.isdigit, err_str))) + 1
-                except Exception:
-                    wait = 30
-                await asyncio.sleep(wait)
-                try:
-                    await bot.send_message(uid, text, reply_markup=reply_markup)
-                    sent += 1
-                except Exception:
+    try:
+        for i, (uid,) in enumerate(rows, start=1):
+            try:
+                markup = reply_markup if reply_markup else generate_app_webapp_button(uid)
+                await bot.send_message(uid, text, reply_markup=markup)
+                sent += 1
+            except Exception as e:
+                err_str = str(e)
+                if "RetryAfter" in err_str:
+                    try:
+                        wait = int("".join(filter(str.isdigit, err_str))) + 1
+                    except Exception:
+                        wait = 30
+                    await asyncio.sleep(wait)
+                    try:
+                        await bot.send_message(uid, text, reply_markup=reply_markup)
+                        sent += 1
+                    except Exception:
+                        failed += 1
+                else:
                     failed += 1
-            else:
-                failed += 1
+
+            # Same pacing as the admin-panel broadcast: slow, steady delivery
+            # instead of blasting all users at once.
+            await asyncio.sleep(BROADCAST_DELAY)
+            if i % BROADCAST_BATCH_SIZE == 0:
+                await asyncio.sleep(BROADCAST_BATCH_PAUSE)
+    finally:
+        _broadcast_running = False
     return sent, failed
 
 
