@@ -1087,7 +1087,7 @@ async function watchAd(){
 
   if (confirmed){
     tg?.HapticFeedback?.notificationOccurred("success");
-    toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
+    toast(`🎉 +${fmt(ADS.reward_amount)} Birr credited!`);
   } else {
     const cr = ADS?.click_reminder;
     const msg = (!cr || !cr.enabled)
@@ -1141,7 +1141,7 @@ async function openDirectLinkAd(){
     try {
       const r = await api("/api/ads/direct-link/claim", { event_id: res.event_id });
       tg?.HapticFeedback?.notificationOccurred("success");
-      toast(`✅ +${fmt(r.credited)} Birr credited`);
+      toast(`🎉 +${fmt(r.credited)} Birr credited!`);
     } catch (claimErr) {
       toast("⚠️ Couldn't credit the reward — try again");
     }
