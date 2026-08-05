@@ -2203,50 +2203,68 @@ async def notify_user_limit_reached(user_id: int):
     except Exception as e:
         logger.warning(f"Failed to send limit notification to {user_id}: {e}")
 
-async def send_ads_limit_reset_reminder(user_id: int) -> bool:
+# Substrings aiogram/Telegram commonly raise when a user is simply gone
+# (blocked the bot, deactivated their account, or the chat no longer
+# exists) — these are expected background noise for reminders sent to
+# a large/dormant audience, not real bugs. Anything else is bucketed
+# separately as a genuine delivery error worth checking in logs.
+_EXPECTED_UNREACHABLE_MARKERS = (
+    "bot was blocked", "forbidden", "user is deactivated",
+    "chat not found", "kicked", "chat_id is empty",
+)
+
+
+async def send_ads_limit_reset_reminder(user_id: int) -> str:
     """For users who HIT their daily ad-watch limit yesterday — tells them
     the limit has reset and invites them back to watch more.
-    Returns True if delivered, False if the send failed (e.g. user
-    blocked the bot)."""
+    Returns 'sent', 'blocked' (user unreachable — expected), or 'error'
+    (unexpected failure worth checking logs for)."""
+    text = (
+        "🎉 <b>Daily Limit Reset!</b>\n\n"
+        "You watched ads yesterday! Your limit has reset for today 🚀\n"
+        "Come back and watch more ads to earn money!"
+    )
     try:
-        text = (
-            "🎉 <b>Daily Limit Reset!</b>\n\n"
-            "You watched ads yesterday! Your limit has reset for today 🚀\n"
-            "Come back and watch more ads to earn money!"
-        )
         await bot.send_message(
             user_id, text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🎬 Watch Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
             ]])
         )
-        return True
+        return "sent"
     except Exception as e:
+        err = str(e).lower()
+        if any(m in err for m in _EXPECTED_UNREACHABLE_MARKERS):
+            return "blocked"
         logger.warning(f"Failed to send ads-reset reminder to {user_id}: {e}")
-        return False
+        return "error"
 
 
-async def send_ads_start_earning_reminder(user_id: int) -> bool:
+async def send_ads_start_earning_reminder(user_id: int) -> str:
     """For users who watched ZERO ads yesterday — a different message
     inviting them to start watching ads to earn, rather than implying
     they're returning to something they already do.
-    Returns True if delivered, False if the send failed."""
+    Returns 'sent', 'blocked' (user unreachable — expected), or 'error'
+    (unexpected failure worth checking logs for)."""
+    text = (
+        "🎬 <b>Your Earning Opportunity is Here!</b>\n\n"
+        "You can easily earn by watching ads.\n"
+        "Open now and get started! 🎬"
+    )
     try:
-        text = (
-            "💰 <b>A Chance to Earn Money is Waiting!</b>\n\n"
-            "You can easily earn money by watching ads.\n"
-            "Open now and start earning! 🎬"
-        )
         await bot.send_message(
             user_id, text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🎬 Watch Ads", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
             ]])
         )
-        return True
+        return "sent"
     except Exception as e:
+        err = str(e).lower()
+        if any(m in err for m in _EXPECTED_UNREACHABLE_MARKERS):
+            return "blocked"
         logger.warning(f"Failed to send ads-start-earning reminder to {user_id}: {e}")
-        return False
+        return "error"
 
 
 # Ethiopian "morning" window this broadcast fires within — roughly
@@ -2317,24 +2335,32 @@ async def notify_ad_limit_reset_loop():
                 )
                 inactive_users = [r["user_id"] for r in await cur2.fetchall()]
 
-            sent_limit, failed_limit, skipped_limit = 0, 0, 0
+            sent_limit, blocked_limit, error_limit, skipped_limit = 0, 0, 0, 0
             for i, uid in enumerate(limit_reached_users, start=1):
                 if await DataEngine.mark_notified_today(uid, "ads_reset_limit"):
-                    ok = await send_ads_limit_reset_reminder(uid)
-                    sent_limit += 1 if ok else 0
-                    failed_limit += 0 if ok else 1
+                    result = await send_ads_limit_reset_reminder(uid)
+                    if result == "sent":
+                        sent_limit += 1
+                    elif result == "blocked":
+                        blocked_limit += 1
+                    else:
+                        error_limit += 1
                 else:
                     skipped_limit += 1
                 await asyncio.sleep(BROADCAST_DELAY)
                 if i % BROADCAST_BATCH_SIZE == 0:
                     await asyncio.sleep(BROADCAST_BATCH_PAUSE)
 
-            sent_earn, failed_earn, skipped_earn = 0, 0, 0
+            sent_earn, blocked_earn, error_earn, skipped_earn = 0, 0, 0, 0
             for i, uid in enumerate(inactive_users, start=1):
                 if await DataEngine.mark_notified_today(uid, "ads_start_earn"):
-                    ok = await send_ads_start_earning_reminder(uid)
-                    sent_earn += 1 if ok else 0
-                    failed_earn += 0 if ok else 1
+                    result = await send_ads_start_earning_reminder(uid)
+                    if result == "sent":
+                        sent_earn += 1
+                    elif result == "blocked":
+                        blocked_earn += 1
+                    else:
+                        error_earn += 1
                 else:
                     skipped_earn += 1
                 await asyncio.sleep(BROADCAST_DELAY)
@@ -2342,8 +2368,8 @@ async def notify_ad_limit_reset_loop():
                     await asyncio.sleep(BROADCAST_BATCH_PAUSE)
 
             await report_ads_reset_broadcast_to_admins(
-                sent_limit, failed_limit, skipped_limit,
-                sent_earn, failed_earn, skipped_earn,
+                sent_limit, blocked_limit, error_limit, skipped_limit,
+                sent_earn, blocked_earn, error_earn, skipped_earn,
             )
 
         except Exception as e:
@@ -2351,24 +2377,31 @@ async def notify_ad_limit_reset_loop():
 
 
 async def report_ads_reset_broadcast_to_admins(
-    sent_limit: int, failed_limit: int, skipped_limit: int,
-    sent_earn: int, failed_earn: int, skipped_earn: int,
+    sent_limit: int, blocked_limit: int, error_limit: int, skipped_limit: int,
+    sent_earn: int, blocked_earn: int, error_earn: int, skipped_earn: int,
 ):
     """Sends a short delivery summary to every configured admin after each
     daily ads-reset broadcast run, so admins know how many users actually
-    got each message without checking logs."""
+    got each message without checking logs. Failures are split into
+    'Blocked' (user unreachable — expected background noise for a
+    dormant audience) and 'Other errors' (unexpected — worth checking
+    logs for) so a high blocked-count doesn't read as a delivery bug."""
     total_sent = sent_limit + sent_earn
-    total_failed = failed_limit + failed_earn
+    total_blocked = blocked_limit + blocked_earn
+    total_error = error_limit + error_earn
     text = (
         "🔔 <b>Ads Reset Broadcast — Delivery Report</b>\n\n"
         "🎉 <b>Limit Reset</b> (watched ads yesterday, hit limit):\n"
         f"   ✅ Delivered: {sent_limit}\n"
-        f"   ❌ Failed: {failed_limit}\n\n"
+        f"   🚫 Blocked/unreachable: {blocked_limit}\n"
+        f"   ❌ Other errors: {error_limit}\n\n"
         "💰 <b>Start Earning</b> (watched 0 ads yesterday):\n"
         f"   ✅ Delivered: {sent_earn}\n"
-        f"   ❌ Failed: {failed_earn}\n\n"
+        f"   🚫 Blocked/unreachable: {blocked_earn}\n"
+        f"   ❌ Other errors: {error_earn}\n\n"
         f"📊 <b>Total delivered:</b> {total_sent}\n"
-        f"📊 <b>Total failed:</b> {total_failed}"
+        f"📊 <b>Total blocked/unreachable:</b> {total_blocked}\n"
+        f"📊 <b>Total other errors:</b> {total_error}"
     )
     for admin_id in ADMIN_IDS:
         try:
