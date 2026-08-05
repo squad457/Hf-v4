@@ -2247,7 +2247,7 @@ async def send_ads_start_earning_reminder(user_id: int) -> str:
     Returns 'sent', 'blocked' (user unreachable — expected), or 'error'
     (unexpected failure worth checking logs for)."""
     text = (
-        "🎬 <b>Your Earning Opportunity is Here!</b>\n\n"
+        "🎬 <b>Start Earning Today!</b>\n\n"
         "You can easily earn by watching ads.\n"
         "Open now and get started! 🎬"
     )
